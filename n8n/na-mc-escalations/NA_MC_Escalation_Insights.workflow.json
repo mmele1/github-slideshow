@@ -1,0 +1,572 @@
+{
+  "name": "NA Multi-Contact Escalation Insights - BigQuery + Level AI v1",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "NA Multi-Contact Escalation Insights",
+        "formDescription": "Escalation mix, journey breakdown, customer asks and agent resolutions for the NA Multi-Contact / CARE queues. Leave the numeric fields blank for the defaults (90-day window, 8 transcripts per journey, 120 max).",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Requested By (email)",
+              "fieldType": "email",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Recipient Email(s)",
+              "fieldType": "text",
+              "placeholder": "one or more, comma separated",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Lookback Days",
+              "fieldType": "number",
+              "placeholder": "90"
+            },
+            {
+              "fieldLabel": "Run Transcript Analysis",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Yes"
+                  },
+                  {
+                    "option": "No"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Transcripts Per Journey",
+              "fieldType": "number",
+              "placeholder": "8"
+            },
+            {
+              "fieldLabel": "Max Transcripts Total",
+              "fieldType": "number",
+              "placeholder": "120 (cost guard)"
+            },
+            {
+              "fieldLabel": "Roster Team Match",
+              "fieldType": "text",
+              "placeholder": "blank = multi contact + specialized supervisor"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "form-trigger",
+      "name": "Escalation Insight Request",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -820,
+        300
+      ],
+      "webhookId": "na-mc-escalation-insights",
+      "notes": "Run on demand. To schedule, replace with a Schedule Trigger + Set node supplying the same field names.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Normalize Request\n// Validates the form input and produces a single `config` object that every\n// downstream node reads. All defaults live here -- change them here only.\n// ---------------------------------------------------------------------------\nconst form = $input.first().json || {};\n\nconst get = (...keys) => {\n  for (const k of keys) {\n    const v = form[k];\n    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();\n  }\n  return '';\n};\n\nconst int = (raw, dflt, min, max) => {\n  const n = Number(raw);\n  if (!Number.isFinite(n) || n <= 0) return dflt;\n  return Math.min(Math.max(Math.round(n), min), max);\n};\n\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst recipientsRaw = get('Recipient Email(s)', 'recipientEmails', 'recipients');\nconst recipients = recipientsRaw\n  .split(/[,;]/)\n  .map((e) => e.trim().toLowerCase())\n  .filter((e) => e.length > 0);\n\nif (recipients.length === 0) {\n  throw new Error('At least one recipient email is required.');\n}\nconst bad = recipients.filter((e) => !EMAIL_RE.test(e));\nif (bad.length) {\n  throw new Error('Invalid recipient email(s): ' + bad.join(', '));\n}\n\n// Roster match patterns: comma separated, lowercased, %-wrapped if needed.\nconst rosterRaw = get('Roster Team Match', 'rosterTeamMatch');\nconst toPattern = (s) => {\n  const t = s.trim().toLowerCase();\n  if (!t) return '';\n  return t.includes('%') ? t : '%' + t + '%';\n};\nconst rosterTeamPatterns = (rosterRaw\n  ? rosterRaw.split(',').map(toPattern).filter(Boolean)\n  : ['%multi%contact%', '%specialized%supervisor%']);\n\nconst runTranscriptAnalysis =\n  get('Run Transcript Analysis', 'runTranscriptAnalysis').toLowerCase() !== 'no';\n\nconst lookbackDays = int(get('Lookback Days', 'lookbackDays'), 90, 7, 400);\nconst today = new Date();\nconst windowEnd = today.toISOString().slice(0, 10);\nconst windowStart = new Date(today.getTime() - lookbackDays * 86400000)\n  .toISOString().slice(0, 10);\n\nconst config = {\n  requestId: 'mc-escalations-' + Date.now(),\n  submittedAt: new Date().toISOString(),\n  requestedBy: get('Requested By (email)', 'requestedBy') || recipients[0],\n  recipientEmails: recipients,\n  recipientEmail: recipients.join(','),\n\n  // ---- window ----\n  lookbackDays,\n  windowStart,\n  windowEnd,\n  reportPeriodLabel: windowStart + ' to ' + windowEnd + ' (' + lookbackDays + ' days)',\n\n  // ---- population definition (validate with sql/00_discovery_labels.sql) ----\n  rosterTeamPatterns,\n  escalationDetailPatterns: [\n    '%escalated by agent%',\n    '%escalation resolved by supervisor%',\n    '%escalation transferred to tier%'\n  ],\n  queuePatterns: ['%multi contact%', '%care%'],\n  naRegionOnly: true,\n\n  // ---- volumes / cost guards ----\n  maxDetailRows: int(get('Max Detail Rows', 'maxDetailRows'), 50000, 100, 200000),\n  perJourneySample: int(get('Transcripts Per Journey', 'perJourneySample'), 8, 1, 50),\n  maxTotalSample: int(get('Max Transcripts Total', 'maxTotalSample'), 120, 1, 400),\n  maxTranscriptChars: 12000,\n  minUtterances: 12,\n  transcriptsPerLlmCall: 5,\n\n  // ---- LLM ----\n  runTranscriptAnalysis,\n  model: 'claude-opus-5',\n  maxTokens: 16000,\n\n  // ---- tables (single source of truth) ----\n  tables: {\n    wrap: 'wf-gcp-us-service-data-prod.omnichannel_public.tbl_service_contact_wrap',\n    employee: 'wf-gcp-us-ae-gat-prod.ops_reporting_core.tbl_snapshot_dim_employee',\n    datamart: 'wf-gcp-us-ae-gat-prod.ops_reporting.tbl_datamart_service_performance_metrics',\n    laiPipeline: 'wf-gcp-us-ae-cs-prod.gsat_reporting.lai_pipeline_data',\n    utterances:\n      'wf-gcp-us-cust-conv-proc-prod.post_order_level_ai_import.conversation_speaker_utterances'\n  },\n  levelAiUrlPrefix: 'https://wayfair.thelevel.ai/organizations/2/conversations/review/'\n};\n\nreturn [{ json: { config } }];\n"
+      },
+      "id": "normalize-request",
+      "name": "Normalize Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -600,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Build Escalation SQL\n// Emits two queries: the quantitative escalation detail set, and the\n// journey-stratified transcript sample. Literals are inlined (the n8n\n// BigQuery node does not pass query parameters).\n// Mirrors sql/10_escalation_detail.sql and sql/20_escalation_transcript_sample.sql\n// ---------------------------------------------------------------------------\nconst cfg = $input.first().json.config;\nconst T = cfg.tables;\n\nconst s = (v) => \"'\" + String(v).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\") + \"'\";\nconst arr = (a) => '[' + a.map(s).join(', ') + ']';\nconst n = (v) => String(Math.round(Number(v)));\n\nconst rosterArr = arr(cfg.rosterTeamPatterns);\nconst escArr = arr(cfg.escalationDetailPatterns);\nconst queueArr = arr(cfg.queuePatterns);\n\nconst regionGuard = cfg.naRegionOnly\n  ? `AND (employee_working_region IS NULL\n         OR LOWER(employee_working_region) LIKE '%north america%'\n         OR LOWER(employee_working_region) IN ('na','us','usa','canada'))`\n  : '';\n\nconst rosterCte = `\nlatest_employee AS (\n  SELECT * EXCEPT(rn) FROM (\n    SELECT\n      e.employee_id, e.employee_name, e.employee_email, e.employee_manager_name,\n      e.employee_workgroup_name, e.employee_working_region, e.employee_working_team,\n      e.employee_working_site, e.employee_date,\n      ROW_NUMBER() OVER (PARTITION BY e.employee_id ORDER BY e.employee_date DESC) AS rn\n    FROM \\`${T.employee}\\` e\n    WHERE e.employee_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n      AND e.employee_is_in_customer_service_org_flag\n  ) WHERE rn = 1\n),\nmc_roster AS (\n  SELECT * FROM latest_employee\n  WHERE (\n      EXISTS (SELECT 1 FROM UNNEST(${rosterArr}) p\n              WHERE LOWER(COALESCE(employee_working_team, '')) LIKE p)\n   OR EXISTS (SELECT 1 FROM UNNEST(${rosterArr}) p\n              WHERE LOWER(COALESCE(employee_workgroup_name, '')) LIKE p)\n  )\n  ${regionGuard}\n)`;\n\nconst escCte = `\nesc_wraps AS (\n  SELECT\n    w.wrap_id,\n    CAST(w.customer_contact_id AS STRING) AS contact_id,\n    w.customer_order_id,\n    w.wrap_agent_id,\n    w.wrap_datetime,\n    DATE(w.wrap_datetime) AS wrap_date,\n    DATE_TRUNC(DATE(w.wrap_datetime), WEEK(MONDAY)) AS wrap_week,\n    DATE_TRUNC(DATE(w.wrap_datetime), MONTH) AS wrap_month,\n    COALESCE(NULLIF(TRIM(w.wrap_primary_reason), ''), 'Unclassified') AS journey,\n    w.wrap_reason_detail AS escalation_detail_reason,\n    w.wrap_contact_channel,\n    w.is_customer_issue_resolved,\n    w.is_automated_wrap,\n    w.wrap_contacted_by_agent_id AS escalated_by_agent_id\n  FROM \\`${T.wrap}\\` w\n  -- If wrap_datetime is DATETIME rather than TIMESTAMP, swap the next line for:\n  --   WHERE w.wrap_datetime >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL n DAY)\n  WHERE w.wrap_datetime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${n(cfg.lookbackDays)} DAY)\n    AND EXISTS (SELECT 1 FROM UNNEST(${escArr}) p\n                WHERE LOWER(COALESCE(w.wrap_reason_detail, '')) LIKE p)\n)`;\n\nconst laiCte = `\nlai AS (\n  SELECT * EXCEPT(rn) FROM (\n    SELECT\n      CAST(l.ContactID AS STRING) AS contact_id,\n      l.OrderNumber AS lai_order_number,\n      l.banking_conversation_id,\n      CAST(l.asr_log_id AS STRING) AS asr_log_id,\n      ROW_NUMBER() OVER (PARTITION BY CAST(l.ContactID AS STRING)\n                         ORDER BY l.ContactDateTime DESC) AS rn\n    FROM \\`${T.laiPipeline}\\` l\n    WHERE DATE(l.ContactDateTime) >= DATE_SUB(CURRENT_DATE(), INTERVAL ${n(cfg.lookbackDays + 2)} DAY)\n  ) WHERE rn = 1\n)`;\n\n// ---- Query 1: escalation detail -------------------------------------------\nconst detailQuery = `\n-- NA MC/CARE escalation detail | ${cfg.reportPeriodLabel} | ${cfg.requestId}\nWITH ${rosterCte},\n${escCte},\nqueue_ctx AS (\n  SELECT * EXCEPT(rn) FROM (\n    SELECT\n      CAST(wc.wrap_compliance_contact_id AS STRING) AS contact_id,\n      wc.wrap_compliance_contact_queue_name AS queue_name,\n      wc.wrap_compliance_entry_type AS entry_type,\n      wc.wrap_compliance_event_datetime AS contact_datetime,\n      ROW_NUMBER() OVER (PARTITION BY CAST(wc.wrap_compliance_contact_id AS STRING)\n                         ORDER BY wc.wrap_compliance_event_datetime DESC) AS rn\n    FROM \\`${T.datamart}\\` t, UNNEST(t.wrap_compliance) AS wc\n    WHERE t.employee_date >= DATE_SUB(CURRENT_DATE(), INTERVAL ${n(cfg.lookbackDays + 2)} DAY)\n      AND wc.wrap_compliance_contact_id IS NOT NULL\n  ) WHERE rn = 1\n),\n${laiCte}\nSELECT\n  e.wrap_id,\n  e.contact_id,\n  e.customer_order_id AS order_id,\n  CAST(e.wrap_datetime AS STRING) AS wrap_datetime,\n  CAST(e.wrap_date AS STRING) AS wrap_date,\n  CAST(e.wrap_week AS STRING) AS wrap_week,\n  CAST(e.wrap_month AS STRING) AS wrap_month,\n  e.journey,\n  e.escalation_detail_reason,\n  e.wrap_contact_channel,\n  e.is_customer_issue_resolved,\n  e.is_automated_wrap,\n  r.employee_id AS mc_agent_id,\n  r.employee_name AS mc_agent_name,\n  r.employee_email AS mc_agent_email,\n  r.employee_manager_name AS mc_manager_name,\n  r.employee_working_team AS mc_team,\n  r.employee_working_site AS mc_site,\n  q.queue_name,\n  CASE\n    WHEN LOWER(COALESCE(q.queue_name,'')) LIKE '%care%'  THEN 'CARE'\n    WHEN LOWER(COALESCE(q.queue_name,'')) LIKE '%multi%' THEN 'Multi-Contact'\n    ELSE 'Other / Unmapped'\n  END AS queue_group,\n  COALESCE(CAST(e.customer_order_id AS STRING), l.lai_order_number) AS order_number_final,\n  l.banking_conversation_id AS levelai_conversation_id,\n  l.asr_log_id,\n  CASE WHEN l.banking_conversation_id IS NOT NULL\n       THEN CONCAT(${s(cfg.levelAiUrlPrefix)}, CAST(l.banking_conversation_id AS STRING)) END AS levelai_url,\n  (l.asr_log_id IS NOT NULL) AS has_transcript_handle\nFROM esc_wraps e\nJOIN mc_roster r ON r.employee_id = e.wrap_agent_id\nLEFT JOIN queue_ctx q ON q.contact_id = e.contact_id\nLEFT JOIN lai l ON l.contact_id = e.contact_id\nWHERE q.queue_name IS NULL\n   OR EXISTS (SELECT 1 FROM UNNEST(${queueArr}) p WHERE LOWER(q.queue_name) LIKE p)\nORDER BY e.wrap_datetime DESC\nLIMIT ${n(cfg.maxDetailRows)}\n`.trim();\n\n// ---- Query 2: journey-stratified transcript sample ------------------------\nconst sampleQuery = `\n-- NA MC/CARE escalation transcript sample | ${cfg.reportPeriodLabel} | ${cfg.requestId}\nWITH ${rosterCte},\n${escCte},\n${laiCte},\neligible AS (\n  SELECT\n    e.wrap_id, e.contact_id, e.journey, e.escalation_detail_reason,\n    e.wrap_datetime, e.is_customer_issue_resolved,\n    r.employee_name AS mc_agent_name,\n    COALESCE(CAST(e.customer_order_id AS STRING), l.lai_order_number) AS order_number,\n    l.asr_log_id, l.banking_conversation_id\n  FROM esc_wraps e\n  JOIN mc_roster r ON r.employee_id = e.wrap_agent_id\n  JOIN lai l ON l.contact_id = e.contact_id\n  WHERE l.asr_log_id IS NOT NULL\n),\nsampled AS (\n  SELECT * EXCEPT(rn_journey) FROM (\n    SELECT eligible.*,\n      ROW_NUMBER() OVER (PARTITION BY journey ORDER BY RAND()) AS rn_journey\n    FROM eligible\n  ) WHERE rn_journey <= ${n(cfg.perJourneySample)}\n),\ntranscripts AS (\n  SELECT\n    CAST(u.asr_log_id AS STRING) AS asr_log_id,\n    COUNT(*) AS utterance_count,\n    STRING_AGG(CONCAT(COALESCE(u.speaker,'UNKNOWN'), ': ', u.transcript), '\\\\n'\n               ORDER BY u.start_time) AS transcript_text\n  FROM \\`${T.utterances}\\` u\n  WHERE u.transcript IS NOT NULL\n    AND LENGTH(u.transcript) > 0\n    AND CAST(u.asr_log_id AS STRING) IN (SELECT asr_log_id FROM sampled)\n  GROUP BY 1\n)\nSELECT\n  s.contact_id, s.wrap_id, s.journey, s.escalation_detail_reason,\n  CAST(s.wrap_datetime AS STRING) AS wrap_datetime,\n  s.is_customer_issue_resolved, s.mc_agent_name, s.order_number, s.asr_log_id,\n  s.banking_conversation_id AS levelai_conversation_id,\n  CASE WHEN s.banking_conversation_id IS NOT NULL\n       THEN CONCAT(${s(cfg.levelAiUrlPrefix)}, CAST(s.banking_conversation_id AS STRING)) END AS levelai_url,\n  t.utterance_count,\n  LENGTH(t.transcript_text) > ${n(cfg.maxTranscriptChars)} AS transcript_truncated,\n  SUBSTR(t.transcript_text, 1, ${n(cfg.maxTranscriptChars)}) AS transcript_text\nFROM sampled s\nJOIN transcripts t USING (asr_log_id)\nWHERE t.utterance_count >= ${n(cfg.minUtterances)}\nORDER BY s.journey, s.wrap_datetime DESC\nLIMIT ${n(cfg.maxTotalSample)}\n`.trim();\n\nreturn [{ json: { config: cfg, detailQuery, sampleQuery } }];\n"
+      },
+      "id": "build-escalation-sql",
+      "name": "Build Escalation SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "projectId": {
+          "__rl": true,
+          "value": "wf-gcp-us-ae-gat-prod",
+          "mode": "id"
+        },
+        "sqlQuery": "={{ $json.detailQuery }}",
+        "options": {
+          "useLegacySql": false,
+          "location": "US"
+        }
+      },
+      "id": "gbq-escalation-detail",
+      "name": "GBQ: Escalation Detail",
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        -160,
+        300
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "Quantitative base: one row per escalated MC/CARE contact. Mirrors sql/10_escalation_detail.sql.",
+      "notesInFlow": true,
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_GBQ_CREDENTIAL_ID",
+          "name": "GBQ service account (replace in n8n UI)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Summarize Escalations\n// Turns the escalation detail rows into the quantitative half of the report:\n// volume, journey mix, queue split, monthly trend, resolution rate, and the\n// transcript coverage that bounds the qualitative half.\n// ---------------------------------------------------------------------------\nconst cfg = $('Normalize Request').first().json.config;\nconst rows = $input.all()\n  .map((i) => i.json)\n  .filter((r) => r && r.wrap_id !== undefined && r.wrap_id !== null);\n\nconst tally = (list, keyFn) => {\n  const m = new Map();\n  for (const r of list) {\n    const k = keyFn(r) || 'Unknown';\n    m.set(k, (m.get(k) || 0) + 1);\n  }\n  return m;\n};\n\nconst toSorted = (map, total) =>\n  [...map.entries()]\n    .map(([key, count]) => ({\n      key,\n      count,\n      pct: total ? Math.round((count / total) * 1000) / 10 : 0\n    }))\n    .sort((a, b) => b.count - a.count);\n\nconst total = rows.length;\nconst truthy = (v) => v === true || v === 'true' || v === 1 || v === '1';\n\nconst journeyMap = new Map();\nfor (const r of rows) {\n  const k = r.journey || 'Unclassified';\n  const e = journeyMap.get(k) || { journey: k, count: 0, resolved: 0, withTranscript: 0, orders: new Set() };\n  e.count += 1;\n  if (truthy(r.is_customer_issue_resolved)) e.resolved += 1;\n  if (truthy(r.has_transcript_handle)) e.withTranscript += 1;\n  if (r.order_number_final) e.orders.add(String(r.order_number_final));\n  journeyMap.set(k, e);\n}\n\nconst byJourney = [...journeyMap.values()]\n  .map((e) => ({\n    journey: e.journey,\n    count: e.count,\n    pct: total ? Math.round((e.count / total) * 1000) / 10 : 0,\n    resolvedInContactPct: e.count ? Math.round((e.resolved / e.count) * 1000) / 10 : 0,\n    transcriptCoveragePct: e.count ? Math.round((e.withTranscript / e.count) * 1000) / 10 : 0,\n    distinctOrders: e.orders.size\n  }))\n  .sort((a, b) => b.count - a.count);\n\nconst byMonth = toSorted(tally(rows, (r) => r.wrap_month), total)\n  .sort((a, b) => String(a.key).localeCompare(String(b.key)));\n\nconst agentMap = tally(rows, (r) => r.mc_agent_name);\nconst withTranscript = rows.filter((r) => truthy(r.has_transcript_handle)).length;\nconst resolvedCount = rows.filter((r) => truthy(r.is_customer_issue_resolved)).length;\n\nconst summary = {\n  totalEscalations: total,\n  distinctOrders: new Set(rows.map((r) => r.order_number_final).filter(Boolean)).size,\n  distinctMcAgents: agentMap.size,\n  resolvedInContactPct: total ? Math.round((resolvedCount / total) * 1000) / 10 : 0,\n  transcriptCoveragePct: total ? Math.round((withTranscript / total) * 1000) / 10 : 0,\n  escalationsWithTranscript: withTranscript,\n  avgPerDay: total ? Math.round((total / cfg.lookbackDays) * 10) / 10 : 0,\n  byJourney,\n  byQueueGroup: toSorted(tally(rows, (r) => r.queue_group), total),\n  byDetailReason: toSorted(tally(rows, (r) => r.escalation_detail_reason), total),\n  byChannel: toSorted(tally(rows, (r) => r.wrap_contact_channel), total),\n  byMonth,\n  bySite: toSorted(tally(rows, (r) => r.mc_site), total).slice(0, 10),\n  byManager: toSorted(tally(rows, (r) => r.mc_manager_name), total).slice(0, 15),\n  topAgentsByVolume: toSorted(agentMap, total).slice(0, 15),\n  dataQuality: {\n    unmappedQueuePct: total\n      ? Math.round((rows.filter((r) => r.queue_group === 'Other / Unmapped').length / total) * 1000) / 10\n      : 0,\n    unclassifiedJourneyPct: total\n      ? Math.round((rows.filter((r) => (r.journey || '') === 'Unclassified').length / total) * 1000) / 10\n      : 0,\n    automatedWrapPct: total\n      ? Math.round((rows.filter((r) => truthy(r.is_automated_wrap)).length / total) * 1000) / 10\n      : 0\n  }\n};\n\nreturn [{ json: { config: cfg, summary } }];\n"
+      },
+      "id": "summarize-escalations",
+      "name": "Summarize Escalations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "version": 2,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "run-transcripts",
+              "leftValue": "={{ $json.config.runTranscriptAnalysis }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-transcripts",
+      "name": "IF: Analyze Transcripts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "projectId": {
+          "__rl": true,
+          "value": "wf-gcp-us-ae-gat-prod",
+          "mode": "id"
+        },
+        "sqlQuery": "={{ $('Build Escalation SQL').first().json.sampleQuery }}",
+        "options": {
+          "useLegacySql": false,
+          "location": "US"
+        }
+      },
+      "id": "gbq-transcript-sample",
+      "name": "GBQ: Transcript Sample",
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        500,
+        180
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "Journey-stratified Level AI phone transcript sample. Mirrors sql/20_escalation_transcript_sample.sql.",
+      "notesInFlow": true,
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_GBQ_CREDENTIAL_ID",
+          "name": "GBQ service account (replace in n8n UI)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Batch Transcripts\n// Groups sampled transcripts into one item per LLM call.\n// ---------------------------------------------------------------------------\nconst cfg = $('Normalize Request').first().json.config;\nconst calls = $input.all()\n  .map((i) => i.json)\n  .filter((r) => r && r.transcript_text && String(r.transcript_text).trim().length > 0);\n\nif (calls.length === 0) {\n  return [{ json: { config: cfg, batchIndex: 0, calls: [], empty: true } }];\n}\n\nconst size = Math.max(1, Number(cfg.transcriptsPerLlmCall) || 5);\nconst out = [];\nfor (let i = 0; i < calls.length; i += size) {\n  out.push({\n    json: {\n      config: cfg,\n      batchIndex: out.length,\n      batchCount: Math.ceil(calls.length / size),\n      sampledTotal: calls.length,\n      calls: calls.slice(i, i + size)\n    }\n  });\n}\nreturn out;\n"
+      },
+      "id": "batch-transcripts",
+      "name": "Batch Transcripts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Build Claude Request\n// Assembles one Messages API request per batch. Structured output guarantees\n// the classification shape. Canonical prompt copy: prompts/escalation_extraction.md\n// ---------------------------------------------------------------------------\nconst item = $input.item.json;\nconst cfg = item.config;\nconst calls = item.calls || [];\n\nconst SYSTEM_PROMPT = [\n  \"You analyze customer service call transcripts for Wayfair's North America\",\n  'Multi-Contact (MC) / CARE escalation team. Each transcript is an escalated',\n  'phone call: a frontline agent transferred an unhappy customer to an MC agent',\n  'or Specialized Supervisor, or the customer reached the escalation queue directly.',\n  '',\n  'Your job is to extract, per call, (a) what triggered the escalation, (b) what the',\n  'customer asked for, (c) what the agent actually provided, and (d) whether the',\n  'issue was closed in that contact.',\n  '',\n  'Rules:',\n  '1. Extract only what the transcript supports. If a field is not evidenced, use',\n  '   \"not_stated\" or null rather than inferring. Do not speculate about intent.',\n  '2. Transcripts are ASR output: expect misrecognized words, missing turns, and',\n  '   speaker-label errors. Judge on meaning, not exact wording.',\n  '3. Use the closed enum values exactly as given. Anything that does not fit goes',\n  '   to \"other\", described in the matching free-text field.',\n  '4. Redact personal data in every free-text field and quote: no customer or agent',\n  '   names, phone numbers, addresses, emails, order numbers, or payment details.',\n  '   Write [REDACTED] in their place.',\n  '5. Quotes must be verbatim customer speech, at most 200 characters, free of',\n  '   personal data. If no clean quote exists, return null.',\n  '6. \"customer_ask\" is what the customer wanted at the point of escalation, not',\n  '   what they settled for. \"agent_provided\" is what the MC agent actually',\n  '   committed to on the call.',\n  '7. Return exactly one object per input call, in input order, keyed by the',\n  '   contact_id given to you.'\n].join('\\n');\n\nconst RESPONSE_SCHEMA = {\n  type: 'object',\n  properties: {\n    classifications: {\n      type: 'array',\n      items: {\n        type: 'object',\n        properties: {\n          contact_id: { type: 'string' },\n          journey_observed: {\n            type: 'string',\n            enum: ['delivery_shipping', 'damaged_defective', 'missing_item_parts', 'returns',\n                   'replacements_rap', 'cancellation', 'billing_credits_refund',\n                   'assembly_service', 'warranty_protection_plan', 'order_placement_change',\n                   'fraud_account_security', 'agent_service_experience', 'other', 'not_stated']\n          },\n          escalation_trigger: {\n            type: 'string',\n            enum: ['repeat_contact_unresolved', 'delivery_delay_or_missed_window',\n                   'damaged_or_defective_item', 'missing_item_or_parts', 'refund_not_received',\n                   'billing_or_charge_dispute', 'return_or_pickup_failure',\n                   'replacement_or_parts_delay', 'cancellation_problem', 'policy_denial',\n                   'resolution_reversed_or_broken_promise', 'agent_conduct_or_communication',\n                   'wait_time_or_transfers', 'supplier_or_third_party_failure',\n                   'system_or_tool_failure', 'customer_requested_supervisor_only',\n                   'other', 'not_stated']\n          },\n          escalation_trigger_detail: { type: ['string', 'null'] },\n          customer_ask_primary: {\n            type: 'string',\n            enum: ['full_refund', 'partial_refund_or_discount', 'replacement_unit',\n                   'replacement_parts', 'expedited_delivery', 'firm_delivery_date',\n                   'return_pickup', 'fee_waiver', 'cancel_order', 'keep_item_and_refund',\n                   'supervisor_or_executive_contact', 'apology_or_accountability',\n                   'callback_commitment', 'information_or_status_only', 'other', 'not_stated']\n          },\n          customer_ask_secondary: { type: ['string', 'null'] },\n          agent_provided_primary: {\n            type: 'string',\n            enum: ['full_refund', 'partial_refund_or_credit', 'replacement_order',\n                   'replacement_parts', 'expedited_reship', 'delivery_escalation_ticket',\n                   'return_label_or_pickup', 'fee_waiver', 'cancellation_processed',\n                   'keep_item_and_refund', 'ticket_to_another_team',\n                   'policy_explanation_no_remedy', 'callback_or_follow_up_promised',\n                   'transferred_to_tier_ii', 'no_resolution_offered', 'other', 'not_stated']\n          },\n          agent_provided_detail: { type: ['string', 'null'] },\n          ask_met: { type: 'string', enum: ['fully_met', 'partially_met', 'not_met', 'unclear'] },\n          resolution_status: {\n            type: 'string',\n            enum: ['resolved_in_contact', 'pending_follow_up', 'transferred', 'unresolved',\n                   'customer_disconnected', 'unclear']\n          },\n          concession_given: { type: 'boolean' },\n          repeat_contacts_mentioned: { type: ['integer', 'null'] },\n          blocker: {\n            type: 'string',\n            enum: ['none', 'policy_limit', 'system_or_tool_limit', 'wizard_no_resolution',\n                   'supplier_or_carrier_dependency', 'approval_or_authority_limit',\n                   'prior_agent_error', 'customer_expectation_gap', 'other']\n          },\n          blocker_detail: { type: ['string', 'null'] },\n          de_escalation_behaviors: {\n            type: 'array',\n            items: {\n              type: 'string',\n              enum: ['empathy_acknowledgment', 'ownership_statement', 'clear_next_steps',\n                     'specific_timeline_given', 'recap_confirmation', 'none_observed']\n            }\n          },\n          further_contact_risk: { type: 'string', enum: ['low', 'medium', 'high'] },\n          further_contact_risk_reason: { type: ['string', 'null'] },\n          customer_quote: { type: ['string', 'null'] },\n          coaching_theme: { type: ['string', 'null'] },\n          confidence: { type: 'number' }\n        },\n        required: ['contact_id', 'journey_observed', 'escalation_trigger',\n                   'customer_ask_primary', 'agent_provided_primary', 'ask_met',\n                   'resolution_status', 'concession_given', 'blocker',\n                   'de_escalation_behaviors', 'further_contact_risk', 'confidence'],\n        additionalProperties: false\n      }\n    }\n  },\n  required: ['classifications'],\n  additionalProperties: false\n};\n\nconst userText = [\n  'Analyze the following ' + calls.length + ' escalated calls. Return one',\n  'classification object per call, in input order.',\n  ''\n].concat(\n  calls.map((c, idx) =>\n    [\n      '--- CALL ' + (idx + 1) + ' ---',\n      'contact_id: ' + c.contact_id,\n      'wrap_journey (agent-selected primary reason): ' + (c.journey || 'Unclassified'),\n      'wrap_detail_reason: ' + (c.escalation_detail_reason || 'not_stated'),\n      'issue_marked_resolved_by_agent: ' + String(c.is_customer_issue_resolved),\n      'transcript_truncated: ' + String(c.transcript_truncated),\n      'transcript:',\n      String(c.transcript_text || '').trim(),\n      ''\n    ].join('\\n')\n  )\n).join('\\n');\n\nconst requestBody = {\n  model: cfg.model,\n  max_tokens: cfg.maxTokens,\n  thinking: { type: 'adaptive' },\n  output_config: { format: { type: 'json_schema', schema: RESPONSE_SCHEMA } },\n  system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],\n  messages: [{ role: 'user', content: userText }]\n};\n\nreturn {\n  json: {\n    config: cfg,\n    batchIndex: item.batchIndex,\n    batchCount: item.batchCount,\n    contactIds: calls.map((c) => c.contact_id),\n    requestBody\n  }\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "build-claude-request",
+      "name": "Build Claude Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 600000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      },
+      "id": "claude-classify",
+      "name": "Claude: Classify Escalations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "Header Auth credential: name = x-api-key, value = Claude API key. For Claude on Vertex AI instead, see docs section 'LLM endpoint options'.",
+      "notesInFlow": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CLAUDE_KEY_CREDENTIAL_ID",
+          "name": "Claude API key (x-api-key header)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Parse Classifications\n// Reads the Messages API responses, validates the structured payload, and\n// re-attaches BigQuery context to each classification. Batch-level failures\n// are recorded, never thrown, so one bad batch cannot lose the whole run.\n// ---------------------------------------------------------------------------\nconst cfg = $('Normalize Request').first().json.config;\n\n// contact_id -> sampled BigQuery row (journey, links, agent, dates)\nconst sampleById = new Map();\nfor (const it of $('GBQ: Transcript Sample').all()) {\n  const r = it.json || {};\n  if (r.contact_id) sampleById.set(String(r.contact_id), r);\n}\n\nconst out = [];\nconst errors = [];\n\n$input.all().forEach((item, i) => {\n  const resp = item.json || {};\n  const ctx = (() => {\n    try { return $('Build Claude Request').all()[i].json; } catch (e) { return {}; }\n  })();\n\n  if (resp.stop_reason === 'refusal') {\n    errors.push({ batchIndex: ctx.batchIndex, reason: 'model_refusal',\n                  detail: JSON.stringify(resp.stop_details || {}) });\n    return;\n  }\n\n  const blocks = Array.isArray(resp.content) ? resp.content : [];\n  const text = blocks.filter((b) => b && b.type === 'text').map((b) => b.text).join('');\n  if (!text) {\n    errors.push({ batchIndex: ctx.batchIndex, reason: 'no_text_block',\n                  detail: (resp.error && resp.error.message) || 'empty response' });\n    return;\n  }\n\n  let parsed;\n  try {\n    parsed = JSON.parse(text);\n  } catch (e) {\n    errors.push({ batchIndex: ctx.batchIndex, reason: 'json_parse_failed',\n                  detail: String(e.message).slice(0, 200) });\n    return;\n  }\n\n  const list = Array.isArray(parsed.classifications) ? parsed.classifications : [];\n  list.forEach((c) => {\n    const src = sampleById.get(String(c.contact_id)) || {};\n    out.push({\n      json: Object.assign({}, c, {\n        journey_wrap: src.journey || 'Unclassified',\n        wrap_id: src.wrap_id || null,\n        wrap_datetime: src.wrap_datetime || null,\n        mc_agent_name: src.mc_agent_name || null,\n        order_number: src.order_number || null,\n        levelai_url: src.levelai_url || null,\n        utterance_count: src.utterance_count || null,\n        transcript_truncated: src.transcript_truncated || false,\n        journey_agrees: (src.journey || '').length > 0 &&\n          String(src.journey).toLowerCase().replace(/[^a-z]/g, '')\n            .includes(String(c.journey_observed || '').split('_')[0]),\n        input_tokens: (resp.usage && resp.usage.input_tokens) || null,\n        output_tokens: (resp.usage && resp.usage.output_tokens) || null,\n        batchIndex: ctx.batchIndex\n      })\n    });\n  });\n});\n\nif (out.length === 0) {\n  return [{ json: { config: cfg, classificationErrors: errors, empty: true } }];\n}\nout.push({ json: { config: cfg, classificationErrors: errors, isErrorSummary: true } });\nreturn out;\n"
+      },
+      "id": "parse-classifications",
+      "name": "Parse Classifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Roll Up Insights\n// Aggregates the per-call classifications into the qualitative half of the\n// report: escalation drivers, customer asks, agent responses, ask-met rate,\n// blockers, and a customer-ask x agent-response cross-tab per journey.\n// ---------------------------------------------------------------------------\nconst cfg = $('Normalize Request').first().json.config;\nconst items = $input.all().map((i) => i.json);\nconst errorRow = items.find((r) => r && r.isErrorSummary);\nconst classifications = items.filter((r) => r && r.contact_id && !r.isErrorSummary);\n\nconst label = (v) =>\n  String(v || 'not_stated').replace(/_/g, ' ').replace(/\\b\\w/g, (m) => m.toUpperCase());\n\nconst rank = (arr, keyFn, limit) => {\n  const m = new Map();\n  for (const c of arr) {\n    const k = keyFn(c);\n    if (k === undefined || k === null || k === '') continue;\n    m.set(k, (m.get(k) || 0) + 1);\n  }\n  const total = arr.length;\n  return [...m.entries()]\n    .map(([key, count]) => ({\n      key,\n      label: label(key),\n      count,\n      pct: total ? Math.round((count / total) * 1000) / 10 : 0\n    }))\n    .sort((a, b) => b.count - a.count)\n    .slice(0, limit || 999);\n};\n\nconst n = classifications.length;\n\n// Per-journey view, driven by the agent-selected wrap journey (authoritative).\nconst journeys = new Map();\nfor (const c of classifications) {\n  const k = c.journey_wrap || 'Unclassified';\n  const e = journeys.get(k) || { journey: k, calls: [] };\n  e.calls.push(c);\n  journeys.set(k, e);\n}\n\nconst byJourney = [...journeys.values()]\n  .map((e) => {\n    const calls = e.calls;\n    const met = calls.filter((c) => c.ask_met === 'fully_met').length;\n    const partial = calls.filter((c) => c.ask_met === 'partially_met').length;\n    const resolved = calls.filter((c) => c.resolution_status === 'resolved_in_contact').length;\n    const highRisk = calls.filter((c) => c.further_contact_risk === 'high').length;\n    const quotes = calls.map((c) => c.customer_quote).filter(Boolean).slice(0, 3);\n    return {\n      journey: e.journey,\n      sampledCalls: calls.length,\n      topTriggers: rank(calls, (c) => c.escalation_trigger, 3),\n      topCustomerAsks: rank(calls, (c) => c.customer_ask_primary, 3),\n      topAgentProvided: rank(calls, (c) => c.agent_provided_primary, 3),\n      topBlockers: rank(calls.filter((c) => c.blocker && c.blocker !== 'none'),\n                        (c) => c.blocker, 3),\n      askFullyMetPct: calls.length ? Math.round((met / calls.length) * 1000) / 10 : 0,\n      askPartiallyMetPct: calls.length ? Math.round((partial / calls.length) * 1000) / 10 : 0,\n      resolvedInContactPct: calls.length ? Math.round((resolved / calls.length) * 1000) / 10 : 0,\n      highFurtherContactRiskPct: calls.length\n        ? Math.round((highRisk / calls.length) * 1000) / 10 : 0,\n      coachingThemes: rank(calls, (c) => c.coaching_theme, 3),\n      quotes\n    };\n  })\n  .sort((a, b) => b.sampledCalls - a.sampledCalls);\n\n// Customer ask -> what the agent actually provided.\nconst crossTab = [];\nconst askGroups = new Map();\nfor (const c of classifications) {\n  const k = c.customer_ask_primary || 'not_stated';\n  const e = askGroups.get(k) || [];\n  e.push(c);\n  askGroups.set(k, e);\n}\nfor (const [ask, calls] of askGroups.entries()) {\n  crossTab.push({\n    ask,\n    askLabel: label(ask),\n    count: calls.length,\n    pct: n ? Math.round((calls.length / n) * 1000) / 10 : 0,\n    provided: rank(calls, (c) => c.agent_provided_primary, 4),\n    fullyMetPct: calls.length\n      ? Math.round((calls.filter((c) => c.ask_met === 'fully_met').length / calls.length) * 1000) / 10\n      : 0\n  });\n}\ncrossTab.sort((a, b) => b.count - a.count);\n\nconst behaviourCounts = new Map();\nfor (const c of classifications) {\n  for (const b of (c.de_escalation_behaviors || [])) {\n    behaviourCounts.set(b, (behaviourCounts.get(b) || 0) + 1);\n  }\n}\n\nconst qualitative = {\n  sampledCalls: n,\n  avgConfidence: n\n    ? Math.round((classifications.reduce((s, c) => s + (Number(c.confidence) || 0), 0) / n) * 100) / 100\n    : 0,\n  lowConfidenceCalls: classifications.filter((c) => Number(c.confidence) < 0.5).length,\n  truncatedTranscripts: classifications.filter((c) => c.transcript_truncated === true).length,\n  topTriggers: rank(classifications, (c) => c.escalation_trigger, 12),\n  topCustomerAsks: rank(classifications, (c) => c.customer_ask_primary, 12),\n  topAgentProvided: rank(classifications, (c) => c.agent_provided_primary, 12),\n  askMet: rank(classifications, (c) => c.ask_met),\n  resolutionStatus: rank(classifications, (c) => c.resolution_status),\n  blockers: rank(classifications.filter((c) => c.blocker && c.blocker !== 'none'),\n                 (c) => c.blocker, 10),\n  furtherContactRisk: rank(classifications, (c) => c.further_contact_risk),\n  concessionRatePct: n\n    ? Math.round((classifications.filter((c) => c.concession_given === true).length / n) * 1000) / 10\n    : 0,\n  observedJourneyMix: rank(classifications, (c) => c.journey_observed, 12),\n  deEscalationBehaviors: [...behaviourCounts.entries()]\n    .map(([key, count]) => ({ key, label: label(key), count,\n                              pct: n ? Math.round((count / n) * 1000) / 10 : 0 }))\n    .sort((a, b) => b.count - a.count),\n  byJourney,\n  crossTab,\n  errors: (errorRow && errorRow.classificationErrors) || [],\n  tokenUsage: {\n    input: classifications.reduce((s, c) => s + (Number(c.input_tokens) || 0), 0),\n    output: classifications.reduce((s, c) => s + (Number(c.output_tokens) || 0), 0)\n  }\n};\n\nreturn [{ json: { config: cfg, qualitative, classifications } }];\n"
+      },
+      "id": "roll-up-insights",
+      "name": "Roll Up Insights",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// Build Report\n// Renders the leadership-ready HTML email plus two CSV attachments\n// (escalation detail, per-call classifications). Runs whether or not the\n// transcript branch executed.\n// ---------------------------------------------------------------------------\nconst cfg = $('Normalize Request').first().json.config;\nconst summary = $('Summarize Escalations').first().json.summary;\n\nlet qualitative = null;\nlet classifications = [];\ntry {\n  const incoming = $input.first().json;\n  if (incoming && incoming.qualitative) {\n    qualitative = incoming.qualitative;\n    classifications = incoming.classifications || [];\n  }\n} catch (e) { /* volume-only run */ }\n\nconst esc = (v) =>\n  String(v === undefined || v === null ? '' : v)\n    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nconst pct = (v) => (v === undefined || v === null ? '-' : Number(v).toFixed(1) + '%');\nconst num = (v) => (v === undefined || v === null ? '-' : Number(v).toLocaleString('en-US'));\n\nconst TH = 'style=\"text-align:left;padding:6px 10px;border-bottom:2px solid #7B2E8E;font:600 12px Arial;color:#333\"';\nconst TD = 'style=\"padding:6px 10px;border-bottom:1px solid #e6e6e6;font:12px Arial;color:#333\"';\nconst H2 = 'style=\"font:600 15px Arial;color:#7B2E8E;margin:26px 0 8px\"';\nconst P = 'style=\"font:12px/1.5 Arial;color:#555;margin:0 0 10px\"';\n\nconst table = (headers, rows) =>\n  '<table cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;width:100%;max-width:820px\">' +\n  '<tr>' + headers.map((h) => '<th ' + TH + '>' + esc(h) + '</th>').join('') + '</tr>' +\n  rows.map((r) => '<tr>' + r.map((c) => '<td ' + TD + '>' + c + '</td>').join('') + '</tr>').join('') +\n  '</table>';\n\nconst rankTable = (list, headerLabel) =>\n  table([headerLabel, 'Calls', 'Share'],\n    (list || []).map((r) => [esc(r.label || r.key), num(r.count), pct(r.pct)]));\n\nconst parts = [];\nparts.push('<div style=\"font:12px Arial;color:#333;max-width:860px\">');\nparts.push('<h1 style=\"font:600 19px Arial;color:#7B2E8E;margin:0 0 4px\">' +\n  'NA Multi-Contact Escalation Insights</h1>');\nparts.push('<p ' + P + '>Window: <b>' + esc(cfg.reportPeriodLabel) + '</b> &middot; Run ID: ' +\n  esc(cfg.requestId) + '</p>');\n\n// ---- headline numbers ----\nparts.push('<h2 ' + H2 + '>1. Escalation volume (wrap-coded, full population)</h2>');\nparts.push(table(\n  ['Escalations', 'Distinct orders', 'MC agents', 'Avg/day', 'Resolved in contact', 'Transcript coverage'],\n  [[num(summary.totalEscalations), num(summary.distinctOrders), num(summary.distinctMcAgents),\n    num(summary.avgPerDay), pct(summary.resolvedInContactPct), pct(summary.transcriptCoveragePct)]]\n));\n\nparts.push('<h2 ' + H2 + '>2. What kinds of escalations are coming in</h2>');\nparts.push('<p ' + P + '>Journey = the wrap Primary Reason the MC agent selected, per the ' +\n  'NA MC Escalation SOP. Resolution rate is the agent-marked ' +\n  '<i>customer issue resolved</i> flag on the same wrap.</p>');\nparts.push(table(\n  ['Journey', 'Escalations', 'Share', 'Resolved in contact', 'Distinct orders', 'Transcript coverage'],\n  (summary.byJourney || []).map((j) => [\n    esc(j.journey), num(j.count), pct(j.pct), pct(j.resolvedInContactPct),\n    num(j.distinctOrders), pct(j.transcriptCoveragePct)\n  ])\n));\n\nparts.push('<h2 ' + H2 + '>3. Queue, channel and trend</h2>');\nparts.push(rankTable(summary.byQueueGroup.map((r) => ({ ...r, label: r.key })), 'Queue group'));\nparts.push('<div style=\"height:10px\"></div>');\nparts.push(table(['Month', 'Escalations', 'Share'],\n  (summary.byMonth || []).map((m) => [esc(m.key), num(m.count), pct(m.pct)])));\n\n// ---- qualitative ----\nif (qualitative) {\n  parts.push('<h2 ' + H2 + '>4. Why customers escalated (transcript sample, n=' +\n    num(qualitative.sampledCalls) + ')</h2>');\n  parts.push('<p ' + P + '>Level AI phone transcripts, journey-stratified sample, ' +\n    'classified by Claude against a fixed taxonomy. Treat as directional: the sample is ' +\n    'stratified by journey, not proportional to volume.</p>');\n  parts.push(rankTable(qualitative.topTriggers, 'Escalation trigger'));\n\n  parts.push('<h2 ' + H2 + '>5. What customers asked for</h2>');\n  parts.push(rankTable(qualitative.topCustomerAsks, 'Customer ask'));\n\n  parts.push('<h2 ' + H2 + '>6. What agents provided</h2>');\n  parts.push(rankTable(qualitative.topAgentProvided, 'Agent resolution'));\n  parts.push('<div style=\"height:10px\"></div>');\n  parts.push('<p ' + P + '>Concession given on <b>' + pct(qualitative.concessionRatePct) +\n    '</b> of sampled calls.</p>');\n  parts.push(rankTable(qualitative.askMet, 'Was the ask met?'));\n\n  parts.push('<h2 ' + H2 + '>7. Ask vs. resolution (where the gap is)</h2>');\n  parts.push(table(['Customer ask', 'Calls', 'Share', 'Fully met', 'Most common agent response'],\n    (qualitative.crossTab || []).map((r) => [\n      esc(r.askLabel), num(r.count), pct(r.pct), pct(r.fullyMetPct),\n      esc((r.provided || []).map((p) => p.label + ' (' + p.count + ')').join(', '))\n    ])));\n\n  parts.push('<h2 ' + H2 + '>8. By journey: trigger, ask, response</h2>');\n  for (const j of (qualitative.byJourney || [])) {\n    parts.push('<h3 style=\"font:600 13px Arial;color:#333;margin:18px 0 6px\">' +\n      esc(j.journey) + ' &middot; ' + num(j.sampledCalls) + ' sampled calls</h3>');\n    parts.push(table(['Dimension', 'Top values'], [\n      ['Escalation triggers', esc((j.topTriggers || []).map((t) => t.label + ' (' + t.count + ')').join(', '))],\n      ['Customer asks', esc((j.topCustomerAsks || []).map((t) => t.label + ' (' + t.count + ')').join(', '))],\n      ['Agent provided', esc((j.topAgentProvided || []).map((t) => t.label + ' (' + t.count + ')').join(', '))],\n      ['Blockers', esc((j.topBlockers || []).map((t) => t.label + ' (' + t.count + ')').join(', ')) || 'None recorded'],\n      ['Ask fully met', pct(j.askFullyMetPct)],\n      ['Resolved in contact', pct(j.resolvedInContactPct)],\n      ['High risk of further contact', pct(j.highFurtherContactRiskPct)]\n    ]));\n    if ((j.quotes || []).length) {\n      parts.push('<p ' + P + '><i>Customer voice:</i> ' +\n        j.quotes.map((q) => '&ldquo;' + esc(q) + '&rdquo;').join(' &middot; ') + '</p>');\n    }\n  }\n\n  parts.push('<h2 ' + H2 + '>9. Barriers and de-escalation behaviours</h2>');\n  parts.push(rankTable(qualitative.blockers, 'Blocker'));\n  parts.push('<div style=\"height:10px\"></div>');\n  parts.push(rankTable(qualitative.deEscalationBehaviors, 'De-escalation behaviour observed'));\n} else {\n  parts.push('<h2 ' + H2 + '>4. Transcript analysis</h2>');\n  parts.push('<p ' + P + '>Not run for this request (Run Transcript Analysis = No, or no ' +\n    'sampled call had a usable Level AI transcript).</p>');\n}\n\n// ---- method + caveats ----\nparts.push('<h2 ' + H2 + '>Method and caveats</h2>');\nparts.push('<ul style=\"font:12px/1.6 Arial;color:#555;padding-left:18px\">');\nparts.push('<li>Population: wraps whose <b>Detailed Reason</b> matches ' +\n  esc(cfg.escalationDetailPatterns.join(' / ')) + ', submitted by agents on the NA MC roster (' +\n  esc(cfg.rosterTeamPatterns.join(' / ')) + '), in MC/CARE queues or with no queue mapping.</li>');\nparts.push('<li>Journey mix (section 2) is the full wrap-coded population. Sections 4-9 are a ' +\n  'journey-stratified transcript sample of ' + num(qualitative ? qualitative.sampledCalls : 0) +\n  ' calls and are directional, not volumetric.</li>');\nparts.push('<li>Escalations missed by this method: any escalation the MC agent wrapped with a ' +\n  'different Detailed Reason. Unclassified journey share: ' +\n  pct(summary.dataQuality.unclassifiedJourneyPct) + '. Unmapped queue share: ' +\n  pct(summary.dataQuality.unmappedQueuePct) + '.</li>');\nparts.push('<li>Phone transcripts only. Digital escalations (chat/email/SMS) are counted in ' +\n  'section 2 but not analyzed in sections 4-9.</li>');\nif (qualitative) {\n  parts.push('<li>Model: ' + esc(cfg.model) + '. Mean classification confidence ' +\n    esc(qualitative.avgConfidence) + '; ' + num(qualitative.lowConfidenceCalls) +\n    ' calls below 0.5 confidence; ' + num(qualitative.truncatedTranscripts) +\n    ' transcripts truncated at ' + num(cfg.maxTranscriptChars) + ' characters.</li>');\n  if ((qualitative.errors || []).length) {\n    parts.push('<li><b>' + num(qualitative.errors.length) + ' batch(es) failed to classify</b>: ' +\n      esc(qualitative.errors.map((e) => e.reason).join(', ')) + '.</li>');\n  }\n}\nparts.push('</ul>');\nparts.push('<p ' + P + '>Attachments: full escalation detail and per-call classifications (CSV).</p>');\nparts.push('</div>');\n\nconst emailHtml = parts.join('\\n');\nconst emailSubject = 'NA Multi-Contact Escalation Insights | ' + cfg.reportPeriodLabel +\n  ' | ' + num(summary.totalEscalations) + ' escalations';\n\n// ---- CSV attachments ----\nconst csvCell = (v) => {\n  const s = v === undefined || v === null ? '' : String(v);\n  return /[\",\\n]/.test(s) ? '\"' + s.replace(/\"/g, '\"\"') + '\"' : s;\n};\nconst toCsv = (rows, cols) =>\n  [cols.join(',')].concat(rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))).join('\\n');\n\nconst detailRows = $('GBQ: Escalation Detail').all()\n  .map((i) => i.json)\n  .filter((r) => r && r.wrap_id !== undefined && r.wrap_id !== null);\n\nconst detailCols = ['wrap_date', 'wrap_datetime', 'journey', 'escalation_detail_reason',\n  'queue_group', 'queue_name', 'wrap_contact_channel', 'is_customer_issue_resolved',\n  'contact_id', 'order_number_final', 'mc_agent_name', 'mc_manager_name', 'mc_team',\n  'mc_site', 'levelai_conversation_id', 'asr_log_id', 'levelai_url'];\n\nconst classCols = ['contact_id', 'wrap_datetime', 'journey_wrap', 'journey_observed',\n  'escalation_trigger', 'escalation_trigger_detail', 'customer_ask_primary',\n  'customer_ask_secondary', 'agent_provided_primary', 'agent_provided_detail', 'ask_met',\n  'resolution_status', 'concession_given', 'repeat_contacts_mentioned', 'blocker',\n  'blocker_detail', 'further_contact_risk', 'further_contact_risk_reason', 'coaching_theme',\n  'customer_quote', 'confidence', 'mc_agent_name', 'order_number', 'levelai_url'];\n\nconst binary = {\n  escalation_detail_csv: {\n    data: Buffer.from(toCsv(detailRows, detailCols), 'utf8').toString('base64'),\n    mimeType: 'text/csv',\n    fileName: 'mc_escalation_detail_' + cfg.windowStart + '_to_' + cfg.windowEnd + '.csv'\n  }\n};\n\nif (classifications.length) {\n  binary.classifications_csv = {\n    data: Buffer.from(toCsv(classifications, classCols), 'utf8').toString('base64'),\n    mimeType: 'text/csv',\n    fileName: 'mc_escalation_classifications_' + cfg.windowStart + '_to_' + cfg.windowEnd + '.csv'\n  };\n}\n\nreturn [{\n  json: {\n    config: cfg,\n    recipientEmail: cfg.recipientEmail,\n    emailSubject,\n    emailHtml,\n    hasClassifications: classifications.length > 0,\n    attachmentProperties: Object.keys(binary).join(',')\n  },\n  binary\n}];\n"
+      },
+      "id": "build-report",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.recipientEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "emailType": "html",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "escalation_detail_csv"
+              },
+              {
+                "property": "classifications_csv"
+              }
+            ]
+          }
+        }
+      },
+      "id": "gmail-send",
+      "name": "Gmail: Send Insight Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2040,
+        300
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2 (replace in n8n UI)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "projectId": {
+          "__rl": true,
+          "value": "wf-gcp-us-ae-cs-prod",
+          "mode": "id"
+        },
+        "datasetId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_DATASET",
+          "mode": "id"
+        },
+        "tableId": {
+          "__rl": true,
+          "value": "tbl_mc_escalation_llm_classifications",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "persist-classifications",
+      "name": "GBQ: Persist Classifications (optional)",
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        1820,
+        100
+      ],
+      "disabled": true,
+      "notes": "Enable to trend escalation drivers over time. Create the target table first (DDL in docs). Feed it from Parse Classifications, not Roll Up Insights.",
+      "notesInFlow": true,
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_GBQ_CREDENTIAL_ID",
+          "name": "GBQ service account (replace in n8n UI)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Escalation Insight Request": {
+      "main": [
+        [
+          {
+            "node": "Normalize Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Request": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Escalation SQL": {
+      "main": [
+        [
+          {
+            "node": "GBQ: Escalation Detail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GBQ: Escalation Detail": {
+      "main": [
+        [
+          {
+            "node": "Summarize Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Escalations": {
+      "main": [
+        [
+          {
+            "node": "IF: Analyze Transcripts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Analyze Transcripts?": {
+      "main": [
+        [
+          {
+            "node": "GBQ: Transcript Sample",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GBQ: Transcript Sample": {
+      "main": [
+        [
+          {
+            "node": "Batch Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Transcripts": {
+      "main": [
+        [
+          {
+            "node": "Build Claude Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Claude Request": {
+      "main": [
+        [
+          {
+            "node": "Claude: Classify Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: Classify Escalations": {
+      "main": [
+        [
+          {
+            "node": "Parse Classifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classifications": {
+      "main": [
+        [
+          {
+            "node": "Roll Up Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roll Up Insights": {
+      "main": [
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Send Insight Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "REPLACE_ON_IMPORT"
+  },
+  "pinData": {},
+  "tags": [],
+  "active": false,
+  "versionId": "v1-na-mc-escalations"
+}
