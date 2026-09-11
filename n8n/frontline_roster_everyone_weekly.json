@@ -1,0 +1,401 @@
+{
+  "name": "Frontline Roster EVERYONE - Weekly Monday 4AM Arizona",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        352
+      ],
+      "id": "e-01",
+      "name": "Run Refresh Manually"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 4 * * 1"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        544
+      ],
+      "id": "e-02",
+      "name": "Weekly - Mondays 4:00 AM Arizona"
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- EVERYONE-level Frontline roster: agents AND managers.\n--\n-- Source: cs_datawarehouse.vw_dim_employee_detail, employee/day grain keyed on\n-- EmID + DateValue. Schema confirmed by probe on 2026-09-11: 27 columns, with\n-- EmID, EmployeeName, EmailAddress, samaccountname, TitleName, SkillLevel,\n-- Team, SiteName, Country, RegionName, StartDate, WgID, MgrEmID, DateValue.\n--\n-- Why not the old source: tbl_..._performance_manager has emid NULL across all\n-- 128,694 'Day' rows and only 39 of 20,599 active Frontline rows carry any\n-- identity, so it can only ever yield managers. It is still used here, but only\n-- as a WORKGROUP LOOKUP, which is the one thing it still does well.\n--\n-- Why not vw_customer_service_master_reporting: the same probe returned 0\n-- columns for it - no access.\n--\n-- Manager name and email come from a SELF-JOIN of the view on MgrEmID = EmID,\n-- so they are real employee records rather than the shifted hierarchy columns\n-- the old source exposed.\n\nWITH view_latest AS (\n  SELECT MAX(DateValue) AS snap\n  FROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail`\n  WHERE DateValue BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 30 DAY)\n                      AND CURRENT_DATE('America/Phoenix')\n),\ncs_latest AS (\n  SELECT MAX(date) AS snap\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 30 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n),\n-- Workgroup names + the 3-level hierarchy, one row per WgID.\n-- The view carries only WgID, no workgroup name, so this supplies both the\n-- names and the 12056 ancestry test.\nwg AS (\n  SELECT\n    SAFE_CAST(t.wgid AS INT64) AS wgid,\n    ANY_VALUE(TRIM(CAST(t.workgroup AS STRING)))       AS workgroup,\n    ANY_VALUE(TRIM(CAST(t.parentworkgroup AS STRING))) AS parentworkgroup,\n    -- >>>>>>>>>>>>>> FRONTLINE SCOPE - WORKGROUP 12056 <<<<<<<<<<<<<<\n    -- DEPTH LIMIT: the lookup table denormalizes only three levels, so 12056\n    -- matches only when it sits at most two levels above the workgroup. Deeper\n    -- branches (e.g. 12056 -> B2B and Canada -> Multiple Contacts -> MC Team 1)\n    -- are NOT matched. If the count looks short, that is why.\n    -- ALTERNATIVE, no depth limit: delete the  WHERE w.in_scope = 1  line at the\n    -- bottom and instead filter the final SELECT on the view's own Team column,\n    -- e.g.  WHERE p.Team = 'Frontline'\n    MAX(IF(12056 IN (\n      SAFE_CAST(t.wgid AS INT64),\n      SAFE_CAST(t.parentwgid AS INT64),\n      SAFE_CAST(t.grandparentwgid AS INT64)\n    ), 1, 0)) AS in_scope\n    -- >>>>>>>>>>>>>>>>>>>>>> END SCOPE <<<<<<<<<<<<<<<<<<<<<<<<<<<<\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\n  CROSS JOIN cs_latest AS cl\n  WHERE t.datetype = 'Day'\n    AND t.date = cl.snap\n  GROUP BY wgid\n),\n-- One row per employee on the newest snapshot. No explicit active flag exists\n-- on this view, so presence in the latest snapshot is what \"current\" means.\npeople AS (\n  SELECT v.*\n  FROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail` AS v\n  CROSS JOIN view_latest AS vl\n  WHERE v.DateValue = vl.snap\n  QUALIFY ROW_NUMBER() OVER (\n    PARTITION BY v.EmID ORDER BY v.DateValue DESC, v.created_datetime DESC\n  ) = 1\n)\nSELECT\n  COALESCE(CAST(p.EmID AS STRING), '')                        AS `Employee ID`,\n  -- \"First Last\". Source may store \"Last, First\"; the regex swaps the halves\n  -- and passes a comma-less name through unchanged.\n  COALESCE(TRIM(REGEXP_REPLACE(TRIM(CAST(p.EmployeeName AS STRING)), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')), '')                              AS `Full Name`,\n  COALESCE(LOWER(TRIM(CAST(p.EmailAddress AS STRING))), '')   AS `Email Address`,\n  COALESCE(TRIM(CAST(p.samaccountname AS STRING)), '')        AS `Sam Account Name`,\n  COALESCE(TRIM(CAST(p.TitleName AS STRING)), '')             AS `Job Title`,\n  COALESCE(CAST(p.SkillLevel AS STRING), '')                  AS `Skill Level`,\n  COALESCE(TRIM(CAST(p.Team AS STRING)), '')                  AS `Team`,\n  COALESCE(TRIM(CAST(p.SiteName AS STRING)), '')              AS `Office Location`,\n  COALESCE(TRIM(CAST(p.Country AS STRING)), '')               AS `Country`,\n  COALESCE(TRIM(CAST(p.RegionName AS STRING)), '')            AS `Region`,\n  IFNULL(FORMAT_DATE('%m/%d/%Y', SAFE_CAST(p.StartDate AS DATE)), '') AS `Start Date`,\n  COALESCE(CAST(p.WgID AS STRING), '')                        AS `Work Group ID`,\n  COALESCE(w.workgroup, '')                                   AS `Work Group`,\n  COALESCE(w.parentworkgroup, '')                             AS `Parent Work Group`,\n  COALESCE(CAST(p.MgrEmID AS STRING), '')                     AS `Manager's Employee ID`,\n  COALESCE(TRIM(REGEXP_REPLACE(TRIM(CAST(m.EmployeeName AS STRING)), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')), '')                              AS `Manager's Name`,\n  COALESCE(LOWER(TRIM(CAST(m.EmailAddress AS STRING))), '')   AS `Manager's Email`,\n  COALESCE(CAST(p.DateValue AS STRING), '')                   AS `Snapshot Date`\nFROM people AS p\nLEFT JOIN wg     AS w ON w.wgid = p.WgID\nLEFT JOIN people AS m ON m.EmID = p.MgrEmID\nWHERE w.in_scope = 1\nORDER BY `Manager's Name`, `Full Name`",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        240,
+        448
+      ],
+      "id": "e-03",
+      "name": "BigQuery - Pull Everyone Roster",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map((i) => i.json || {}).filter((r) => Object.keys(r).length > 0);\nconst toText = (v) => (v === null || v === undefined) ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));\nif (rows.length === 0) return [{ json: { row_count: 0, column_count: 0, columns: [], records: [] } }];\nconst columns = [];\nfor (const r of rows) for (const k of Object.keys(r)) if (!columns.includes(k)) columns.push(k);\nconst seen = new Set(); const records = []; const teams = new Set(); const mgrs = new Set();\nfor (const r of rows) {\n  const id = toText(r['Employee ID']);\n  if (id !== '' && seen.has(id)) continue;\n  seen.add(id);\n  records.push(columns.map((c) => toText(r[c])));\n  if (toText(r['Team'])) teams.add(toText(r['Team']));\n  if (toText(r[\"Manager's Name\"])) mgrs.add(toText(r[\"Manager's Name\"]));\n}\nreturn [{ json: {\n  row_count: records.length, column_count: columns.length, columns, records,\n  teams_present: [...teams].sort(), manager_count: mgrs.size,\n  snapshot_date: toText(rows[0]['Snapshot Date']),\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        448
+      ],
+      "id": "e-04",
+      "name": "Code - Normalize Roster"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.row_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        448
+      ],
+      "id": "e-05",
+      "name": "IF - Roster Returned Rows"
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Runs ONLY when the roster returns zero rows. Reports each stage separately\n-- so the losing stage is named rather than guessed.\nWITH view_latest AS (\n  SELECT MAX(DateValue) AS snap\n  FROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail`\n  WHERE DateValue >= DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 60 DAY)\n),\ncs_latest AS (\n  SELECT MAX(date) AS snap\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date >= DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 60 DAY)\n),\nview_stats AS (\n  SELECT\n    CAST((SELECT snap FROM view_latest) AS STRING) AS view_latest_date,\n    COUNT(*)                    AS view_rows,\n    COUNT(DISTINCT v.EmID)      AS view_employees,\n    COUNT(DISTINCT v.WgID)      AS view_workgroups,\n    COUNT(v.EmployeeName)       AS name_nonnull,\n    COUNT(v.EmailAddress)       AS email_nonnull,\n    COUNT(v.MgrEmID)            AS mgremid_nonnull\n  FROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail` AS v\n  WHERE v.DateValue = (SELECT snap FROM view_latest)\n),\nwg_scope AS (\n  SELECT DISTINCT SAFE_CAST(t.wgid AS INT64) AS wgid\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\n  WHERE t.datetype = 'Day'\n    AND t.date = (SELECT snap FROM cs_latest)\n    AND 12056 IN (\n      SAFE_CAST(t.wgid AS INT64),\n      SAFE_CAST(t.parentwgid AS INT64),\n      SAFE_CAST(t.grandparentwgid AS INT64)\n    )\n),\nscope_stats AS (\n  SELECT\n    CAST((SELECT snap FROM cs_latest) AS STRING) AS cs_latest_date,\n    (SELECT COUNT(*) FROM wg_scope)              AS workgroups_in_scope\n),\noverlap AS (\n  SELECT COUNT(DISTINCT v.EmID) AS employees_in_scope\n  FROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail` AS v\n  WHERE v.DateValue = (SELECT snap FROM view_latest)\n    AND v.WgID IN (SELECT wgid FROM wg_scope)\n)\nSELECT * FROM view_stats CROSS JOIN scope_stats CROSS JOIN overlap",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        960,
+        700
+      ],
+      "id": "e-06",
+      "name": "BigQuery - Diagnose Empty Result",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Name the stage that lost the rows.\nconst rows = $input.all().map((i) => i.json || {}).filter((r) => Object.keys(r).length > 0);\nconst L = [];\nL.push('EVERYONE-LEVEL FRONTLINE ROSTER ABORTED - zero rows.');\nL.push('The Google Sheet was NOT cleared. Its previous contents are intact.');\nL.push('');\nif (rows.length === 0) {\n  L.push('DIAGNOSIS: the profiling query itself returned nothing, so');\n  L.push('vw_dim_employee_detail is unreachable or empty in the last 60 days.');\n} else {\n  const r = rows[0];\n  for (const [k, v] of Object.entries(r)) L.push(`  ${k} = ${v}`);\n  L.push('');\n  if (Number(r.view_rows || 0) === 0) {\n    L.push('DIAGNOSIS: no rows on the latest DateValue. Check the view is still loading.');\n  } else if (Number(r.workgroups_in_scope || 0) === 0) {\n    L.push('DIAGNOSIS: workgroup 12056 matched NO workgroups in the lookup table, so');\n    L.push('the scope resolved to an empty set. This is the documented depth limit -');\n    L.push('the lookup only exposes three hierarchy levels.');\n    L.push('FIX: in the final SELECT, replace  WHERE w.in_scope = 1  with');\n    L.push(\"  WHERE p.Team = 'Frontline'   (the view carries its own Team column)\");\n  } else if (Number(r.employees_in_scope || 0) === 0) {\n    L.push(`DIAGNOSIS: ${r.workgroups_in_scope} workgroups are in scope, but NO employee in`);\n    L.push('the view sits in any of them. The two sources disagree on WgID, so the');\n    L.push('workgroup join is the wrong bridge.');\n    L.push(\"FIX: replace  WHERE w.in_scope = 1  with  WHERE p.Team = 'Frontline'\");\n  } else {\n    L.push(`DIAGNOSIS: ${r.employees_in_scope} employees ARE in scope, so the filters are fine`);\n    L.push('and something later dropped them. Send this output back.');\n  }\n}\nreturn [{ json: { diagnosis: L.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        700
+      ],
+      "id": "e-07",
+      "name": "Code - Explain Empty Result"
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ $json.diagnosis }}"
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        700
+      ],
+      "id": "e-08",
+      "name": "Stop and Error - Empty Result Guard"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values/Sheet1:clear",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        448
+      ],
+      "id": "e-09",
+      "name": "Sheets API - Clear Tab",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const TAB_NAME = 'Sheet1';\nconst CHUNK_ROWS = 5000;\nconst source = $('Code - Normalize Roster').first().json;\nconst allRows = [source.columns || [], ...(source.records || [])];\nconst chunks = [];\nfor (let offset = 0; offset < allRows.length; offset += CHUNK_ROWS) {\n  const slice = allRows.slice(offset, offset + CHUNK_ROWS);\n  const startRow = offset + 1;\n  chunks.push({ chunk_index: chunks.length + 1, chunk_rows: slice.length, start_row: startRow,\n    request_body: { valueInputOption: 'RAW',\n      data: [{ range: `${TAB_NAME}!A${startRow}`, majorDimension: 'ROWS', values: slice }] } });\n}\nreturn chunks.map((c) => ({ json: { ...c, chunk_total: chunks.length } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        448
+      ],
+      "id": "e-10",
+      "name": "Code - Build Sheets Write Chunks"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.request_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        448
+      ],
+      "id": "e-11",
+      "name": "Sheets API - Write Roster Chunk",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $('Code - Normalize Roster').first().json;\nconst chunks = $('Code - Build Sheets Write Chunks').all();\nreturn [{ json: {\n  status: 'SUCCESS',\n  spreadsheet_id: '1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4',\n  tab_name: 'Sheet1',\n  grain: 'EVERYONE - agents and managers, from vw_dim_employee_detail',\n  scope: 'workgroup 12056 ancestry via the performance-manager workgroup lookup',\n  scope_depth_limit: 'lookup exposes only 3 hierarchy levels; branches deeper than 2 below 12056 are excluded',\n  employee_row_count: source.row_count,\n  distinct_manager_count: source.manager_count,\n  teams_present: source.teams_present,\n  column_count: source.column_count,\n  columns_written: source.columns,\n  snapshot_date: source.snapshot_date,\n  sheets_write_requests_used: chunks.length + 1,\n  schedule: 'Mondays 04:00 America/Phoenix (Arizona, no DST) = 11:00 UTC',\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        448
+      ],
+      "id": "e-12",
+      "name": "Code - Refresh Complete",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## Frontline Roster - EVERYONE - Weekly Monday 4AM Arizona\n\n### This is agents AND managers\nSource switched to `wf-gcp-us-ae-cs-prod.cs_datawarehouse.vw_dim_employee_detail`, employee/day grain keyed on EmID + DateValue. Schema confirmed by probe on 2026-09-11: 27 columns.\n\nThe old source, tbl_customer_service_employee_performance_manager, could only ever yield managers - emid is NULL across all 128,694 'Day' rows and only 39 of 20,599 active Frontline rows carried any identity. It is still used here, but ONLY as a workgroup-name and hierarchy lookup, which is what it still does well.\n\nvw_customer_service_master_reporting returned 0 columns on the probe - no access - so it is not used.\n\n### Manager data is now real\nManager's Name and Manager's Email come from a SELF-JOIN of the view on MgrEmID = EmID. These are genuine employee records, not the shifted hierarchy columns the old source exposed, so the level confusion is gone.\n\n### Job Title is back\nTitleName exists on this view, so Job Title returns after being removed as unsourceable. Skill Level, Country and Region are new too.\n\n### 18 columns\nEmployee ID, Full Name, Email Address, Sam Account Name, Job Title, Skill Level, Team, Office Location, Country, Region, Start Date, Work Group ID, Work Group, Parent Work Group, Manager's Employee ID, Manager's Name, Manager's Email, Snapshot Date.\n\nFull Name and Manager's Name render \"First Last\". The regex swaps \"Last, First\" and passes a comma-less name through unchanged, so it is correct either way.\n\nThis workflow REPLACES row 1 of the tab.\n\n### Scope: workgroup 12056 - depth limit applies\nThe view has no workgroup name and no ancestry, only WgID. The 12056 test therefore runs against the lookup table's three levels (wgid, parentwgid, grandparentwgid), so 12056 matches only when it sits at most two levels above a workgroup. Deeper branches such as\n  12056 -> B2B and Canada -> Multiple Contacts -> MC Team 1\nare NOT matched. Multiple Contacts teams may be absent.\n\nNO-DEPTH-LIMIT ALTERNATIVE: the view carries its own Team column. Replace\n  WHERE w.in_scope = 1\nwith\n  WHERE p.Team = 'Frontline'\nTeam is an output column so you can see the real values first.\n\n### There is no active flag\nThis view has no active or termination column. Presence in the latest DateValue snapshot is what \"current\" means here.\n\n### Safety\nZero rows means the sheet is NOT cleared and the run fails with a stage-by-stage profile: rows on the latest snapshot, workgroups resolved in scope, and employees overlapping that scope. It names which stage lost the rows and gives the one-line fix.\n\n30-day snapshot window on both sources, deliberately narrow so stale data is never published as current.\n\n### Schedule\nWorkflow timezone America/Phoenix, cron 0 4 * * 1 = 11:00 UTC year-round, Arizona has no DST. Confirm the timezone in Workflow Settings after import.\n\n### After import\nSelect credentials on the two BigQuery nodes and the two Sheets nodes, run manually, check the summary for employee_row_count and teams_present, then activate.",
+        "height": 1100,
+        "width": 760,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -820,
+        100
+      ],
+      "id": "e-13",
+      "name": "README"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run Refresh Manually": {
+      "main": [
+        [
+          {
+            "node": "BigQuery - Pull Everyone Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly - Mondays 4:00 AM Arizona": {
+      "main": [
+        [
+          {
+            "node": "BigQuery - Pull Everyone Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Pull Everyone Roster": {
+      "main": [
+        [
+          {
+            "node": "Code - Normalize Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Normalize Roster": {
+      "main": [
+        [
+          {
+            "node": "IF - Roster Returned Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Roster Returned Rows": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Clear Tab",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "BigQuery - Diagnose Empty Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Diagnose Empty Result": {
+      "main": [
+        [
+          {
+            "node": "Code - Explain Empty Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Explain Empty Result": {
+      "main": [
+        [
+          {
+            "node": "Stop and Error - Empty Result Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets API - Clear Tab": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Sheets Write Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Build Sheets Write Chunks": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Write Roster Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets API - Write Roster Chunk": {
+      "main": [
+        [
+          {
+            "node": "Code - Refresh Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timezone": "America/Phoenix",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "versionId": "b6d4c810-2f77-4a93-8e15-0c7351aa9d62",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "03eaefce1798e2883471ae7d5d2dfbc186343411ac19c565c97d8bae537d45f1"
+  },
+  "nodeGroups": [],
+  "id": "FrontlineEveryone1",
+  "tags": []
+}
