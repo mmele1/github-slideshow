@@ -5,7 +5,10 @@
       "parameters": {},
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [0, 352],
+      "position": [
+        0,
+        352
+      ],
       "id": "7a1c0d10-0001-4a00-8a00-000000000001",
       "name": "Run Refresh Manually"
     },
@@ -22,21 +25,27 @@
       },
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [0, 544],
+      "position": [
+        0,
+        544
+      ],
       "id": "7a1c0d10-0002-4a00-8a00-000000000002",
       "name": "Weekly - Mondays 4:00 AM Arizona"
     },
     {
       "parameters": {
         "projectId": "wf-gcp-us-ae-gat-prod",
-        "sqlQuery": "-- Full Customer Service org roster: every active employee (agents) plus the\n-- complete management chain and org attributes on each row.\n--\n-- Source table is EMPLOYEE/DAY level (not manager level), so no join is needed.\n-- Verified column list: emid, employee, mgremid, manager, mgr2emid, manager2,\n-- srmgremid, srmanager, name, username, stillatwayfair, siteid, site,\n-- virtualflag, team, styid, subentity, regionid, region, typeofsite, wgid,\n-- workgroup, parentwgid, parentworkgroup, grandparentwgid,\n-- grandparentparentworkgroup, lastrundate, currentskilllevel, overallranking,\n-- topxpercent, skillranking, majorityskill, skill_1_start_date,\n-- skill_2_start_date, skill_3_start_date, hierarchylevel, emailaddress,\n-- mgremailaddress, TimePeriod, date, datetype, swapid, hiredate, daystenured,\n-- plus a long tail of *_to_goal performance metrics (excluded here on purpose --\n-- this is a directory, not a scorecard). To include them too, add them to the\n-- SELECT list; the downstream Code nodes build headers dynamically from whatever\n-- columns this query returns, so no other node needs to change.\n\nWITH latest_snapshot AS (\n  SELECT MAX(date) AS snapshot_date\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 7 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n)\nSELECT\n  -- Employee / agent identity\n  CAST(t.emid AS STRING) AS `Employee ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.employee, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Employee Name`,\n  TRIM(COALESCE(t.name, '')) AS `Employee Name Raw`,\n  LOWER(TRIM(COALESCE(t.username, ''))) AS `Username`,\n  LOWER(TRIM(COALESCE(t.emailaddress, ''))) AS `Employee Email`,\n  IF(t.stillatwayfair, 'Yes', 'No') AS `Active`,\n  CAST(t.hierarchylevel AS STRING) AS `Hierarchy Level`,\n  CAST(SAFE_CAST(t.hiredate AS DATE) AS STRING) AS `Hire Date`,\n  CAST(t.daystenured AS STRING) AS `Days Tenured`,\n\n  -- Management chain\n  CAST(t.mgremid AS STRING) AS `Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.manager, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager Name`,\n  LOWER(TRIM(COALESCE(t.mgremailaddress, ''))) AS `Manager Email`,\n  CAST(t.mgr2emid AS STRING) AS `Manager 2 ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.manager2, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager 2 Name`,\n  CAST(t.srmgremid AS STRING) AS `Senior Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.srmanager, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Senior Manager Name`,\n\n  -- Workgroup hierarchy\n  TRIM(COALESCE(t.team, '')) AS `Team`,\n  CAST(t.wgid AS STRING) AS `Workgroup ID`,\n  TRIM(COALESCE(t.workgroup, '')) AS `Workgroup`,\n  CAST(t.parentwgid AS STRING) AS `Parent Workgroup ID`,\n  TRIM(COALESCE(t.parentworkgroup, '')) AS `Parent Workgroup`,\n  CAST(t.grandparentwgid AS STRING) AS `Grandparent Workgroup ID`,\n  TRIM(COALESCE(t.grandparentparentworkgroup, '')) AS `Grandparent Workgroup`,\n\n  -- Site / geography\n  CAST(t.siteid AS STRING) AS `Site ID`,\n  TRIM(COALESCE(t.site, '')) AS `Site`,\n  TRIM(COALESCE(t.typeofsite, '')) AS `Site Type`,\n  CAST(t.virtualflag AS STRING) AS `Virtual Flag`,\n  TRIM(COALESCE(t.subentity, '')) AS `Subentity`,\n  CAST(t.regionid AS STRING) AS `Region ID`,\n  TRIM(COALESCE(t.region, '')) AS `Region`,\n\n  -- Skill / ranking attributes\n  CAST(t.currentskilllevel AS STRING) AS `Current Skill Level`,\n  TRIM(COALESCE(t.majorityskill, '')) AS `Majority Skill`,\n  CAST(t.skillranking AS STRING) AS `Skill Ranking`,\n  CAST(t.overallranking AS STRING) AS `Overall Ranking`,\n  CAST(t.topxpercent AS STRING) AS `Top X Percent`,\n  CAST(SAFE_CAST(t.skill_1_start_date AS DATE) AS STRING) AS `Skill 1 Start Date`,\n  CAST(SAFE_CAST(t.skill_2_start_date AS DATE) AS STRING) AS `Skill 2 Start Date`,\n  CAST(SAFE_CAST(t.skill_3_start_date AS DATE) AS STRING) AS `Skill 3 Start Date`,\n\n  -- Record metadata\n  CAST(t.styid AS STRING) AS `Style ID`,\n  CAST(t.swapid AS STRING) AS `Swap ID`,\n  CAST(SAFE_CAST(t.lastrundate AS DATE) AS STRING) AS `Last Run Date`,\n  CAST(s.snapshot_date AS STRING) AS `Snapshot Date`,\n  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP(), 'America/Phoenix') AS `Refreshed At Arizona`\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\nCROSS JOIN latest_snapshot AS s\nWHERE t.datetype = 'Day'\n  AND t.date = s.snapshot_date\n  AND t.stillatwayfair IS TRUE\n  AND t.emid IS NOT NULL\n-- One row per employee even if the source carries multiple TimePeriod rows per day\nQUALIFY ROW_NUMBER() OVER (PARTITION BY t.emid ORDER BY t.lastrundate DESC, t.mgremid) = 1\nORDER BY `Senior Manager Name`, `Manager Name`, `Employee Name`",
+        "sqlQuery": "-- Full Customer Service org roster: every active employee (agents) plus the\n-- complete management chain and org attributes on each row.\n--\n-- Source table is EMPLOYEE/DAY level (not manager level), so no join is needed.\n-- Verified column list: emid, employee, mgremid, manager, mgr2emid, manager2,\n-- srmgremid, srmanager, name, username, stillatwayfair, siteid, site,\n-- virtualflag, team, styid, subentity, regionid, region, typeofsite, wgid,\n-- workgroup, parentwgid, parentworkgroup, grandparentwgid,\n-- grandparentparentworkgroup, lastrundate, currentskilllevel, overallranking,\n-- topxpercent, skillranking, majorityskill, skill_1_start_date,\n-- skill_2_start_date, skill_3_start_date, hierarchylevel, emailaddress,\n-- mgremailaddress, TimePeriod, date, datetype, swapid, hiredate, daystenured,\n-- plus a long tail of *_to_goal performance metrics (excluded here on purpose --\n-- this is a directory, not a scorecard). To include them too, add them to the\n-- SELECT list; the downstream Code nodes build headers dynamically from whatever\n-- columns this query returns, so no other node needs to change.\n\n-- NOTE: every free-text column is wrapped in CAST(... AS STRING) before\n-- COALESCE. The source table's types do not match its SQL-era schema doc\n-- (e.g. majorityskill is INT64), so casting first keeps this query working\n-- regardless of the underlying type.\n\nWITH latest_snapshot AS (\n  SELECT MAX(date) AS snapshot_date\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 7 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n)\nSELECT\n  -- Employee / agent identity\n  CAST(t.emid AS STRING) AS `Employee ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.employee AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Employee Name`,\n  TRIM(COALESCE(CAST(t.name AS STRING), '')) AS `Employee Name Raw`,\n  LOWER(TRIM(COALESCE(CAST(t.username AS STRING), ''))) AS `Username`,\n  LOWER(TRIM(COALESCE(CAST(t.emailaddress AS STRING), ''))) AS `Employee Email`,\n  IF(t.stillatwayfair, 'Yes', 'No') AS `Active`,\n  CAST(t.hierarchylevel AS STRING) AS `Hierarchy Level`,\n  CAST(SAFE_CAST(t.hiredate AS DATE) AS STRING) AS `Hire Date`,\n  CAST(t.daystenured AS STRING) AS `Days Tenured`,\n\n  -- Management chain\n  CAST(t.mgremid AS STRING) AS `Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager Name`,\n  LOWER(TRIM(COALESCE(CAST(t.mgremailaddress AS STRING), ''))) AS `Manager Email`,\n  CAST(t.mgr2emid AS STRING) AS `Manager 2 ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager2 AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager 2 Name`,\n  CAST(t.srmgremid AS STRING) AS `Senior Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.srmanager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Senior Manager Name`,\n\n  -- Workgroup hierarchy\n  TRIM(COALESCE(CAST(t.team AS STRING), '')) AS `Team`,\n  CAST(t.wgid AS STRING) AS `Workgroup ID`,\n  TRIM(COALESCE(CAST(t.workgroup AS STRING), '')) AS `Workgroup`,\n  CAST(t.parentwgid AS STRING) AS `Parent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.parentworkgroup AS STRING), '')) AS `Parent Workgroup`,\n  CAST(t.grandparentwgid AS STRING) AS `Grandparent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.grandparentparentworkgroup AS STRING), '')) AS `Grandparent Workgroup`,\n\n  -- Site / geography\n  CAST(t.siteid AS STRING) AS `Site ID`,\n  TRIM(COALESCE(CAST(t.site AS STRING), '')) AS `Site`,\n  TRIM(COALESCE(CAST(t.typeofsite AS STRING), '')) AS `Site Type`,\n  CAST(t.virtualflag AS STRING) AS `Virtual Flag`,\n  TRIM(COALESCE(CAST(t.subentity AS STRING), '')) AS `Subentity`,\n  CAST(t.regionid AS STRING) AS `Region ID`,\n  TRIM(COALESCE(CAST(t.region AS STRING), '')) AS `Region`,\n\n  -- Skill / ranking attributes\n  CAST(t.currentskilllevel AS STRING) AS `Current Skill Level`,\n  TRIM(COALESCE(CAST(t.majorityskill AS STRING), '')) AS `Majority Skill`,\n  CAST(t.skillranking AS STRING) AS `Skill Ranking`,\n  CAST(t.overallranking AS STRING) AS `Overall Ranking`,\n  CAST(t.topxpercent AS STRING) AS `Top X Percent`,\n  CAST(SAFE_CAST(t.skill_1_start_date AS DATE) AS STRING) AS `Skill 1 Start Date`,\n  CAST(SAFE_CAST(t.skill_2_start_date AS DATE) AS STRING) AS `Skill 2 Start Date`,\n  CAST(SAFE_CAST(t.skill_3_start_date AS DATE) AS STRING) AS `Skill 3 Start Date`,\n\n  -- Record metadata\n  CAST(t.styid AS STRING) AS `Style ID`,\n  CAST(t.swapid AS STRING) AS `Swap ID`,\n  CAST(SAFE_CAST(t.lastrundate AS DATE) AS STRING) AS `Last Run Date`,\n  CAST(s.snapshot_date AS STRING) AS `Snapshot Date`,\n  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP(), 'America/Phoenix') AS `Refreshed At Arizona`\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\nCROSS JOIN latest_snapshot AS s\nWHERE t.datetype = 'Day'\n  AND t.date = s.snapshot_date\n  AND t.stillatwayfair IS TRUE\n  AND t.emid IS NOT NULL\n-- One row per employee even if the source carries multiple TimePeriod rows per day\nQUALIFY ROW_NUMBER() OVER (PARTITION BY t.emid ORDER BY t.lastrundate DESC, t.mgremid) = 1\nORDER BY `Senior Manager Name`, `Manager Name`, `Employee Name`",
         "options": {
           "useLegacySql": false
         }
       },
       "type": "n8n-nodes-base.googleBigQuery",
       "typeVersion": 2.1,
-      "position": [240, 448],
+      "position": [
+        240,
+        448
+      ],
       "id": "7a1c0d10-0003-4a00-8a00-000000000003",
       "name": "BigQuery - Pull Full CS Org Roster",
       "alwaysOutputData": true,
@@ -56,7 +65,10 @@
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [480, 448],
+      "position": [
+        480,
+        448
+      ],
       "id": "7a1c0d10-0004-4a00-8a00-000000000004",
       "name": "Code - Normalize Roster"
     },
@@ -86,7 +98,10 @@
       },
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [720, 448],
+      "position": [
+        720,
+        448
+      ],
       "id": "7a1c0d10-0005-4a00-8a00-000000000005",
       "name": "IF - Roster Returned Rows"
     },
@@ -96,7 +111,10 @@
       },
       "type": "n8n-nodes-base.stopAndError",
       "typeVersion": 1,
-      "position": [960, 624],
+      "position": [
+        960,
+        624
+      ],
       "id": "7a1c0d10-0006-4a00-8a00-000000000006",
       "name": "Stop and Error - Empty Result Guard"
     },
@@ -113,7 +131,10 @@
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [960, 448],
+      "position": [
+        960,
+        448
+      ],
       "id": "7a1c0d10-0007-4a00-8a00-000000000007",
       "name": "Sheets API - Clear Sheet1",
       "executeOnce": true,
@@ -133,7 +154,10 @@
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1200, 448],
+      "position": [
+        1200,
+        448
+      ],
       "id": "7a1c0d10-0008-4a00-8a00-000000000008",
       "name": "Code - Build Sheets Write Chunks"
     },
@@ -150,7 +174,10 @@
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1440, 448],
+      "position": [
+        1440,
+        448
+      ],
       "id": "7a1c0d10-0009-4a00-8a00-000000000009",
       "name": "Sheets API - Write Roster Chunk",
       "retryOnFail": true,
@@ -169,7 +196,10 @@
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1680, 448],
+      "position": [
+        1680,
+        448
+      ],
       "id": "7a1c0d10-0010-4a00-8a00-000000000010",
       "name": "Code - Refresh Complete",
       "executeOnce": true
@@ -183,7 +213,10 @@
       },
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-780, 140],
+      "position": [
+        -780,
+        140
+      ],
       "id": "7a1c0d10-0011-4a00-8a00-000000000011",
       "name": "README"
     }
@@ -191,31 +224,99 @@
   "pinData": {},
   "connections": {
     "Run Refresh Manually": {
-      "main": [[{ "node": "BigQuery - Pull Full CS Org Roster", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "BigQuery - Pull Full CS Org Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Weekly - Mondays 4:00 AM Arizona": {
-      "main": [[{ "node": "BigQuery - Pull Full CS Org Roster", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "BigQuery - Pull Full CS Org Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "BigQuery - Pull Full CS Org Roster": {
-      "main": [[{ "node": "Code - Normalize Roster", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Code - Normalize Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Code - Normalize Roster": {
-      "main": [[{ "node": "IF - Roster Returned Rows", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "IF - Roster Returned Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "IF - Roster Returned Rows": {
       "main": [
-        [{ "node": "Sheets API - Clear Sheet1", "type": "main", "index": 0 }],
-        [{ "node": "Stop and Error - Empty Result Guard", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Sheets API - Clear Sheet1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop and Error - Empty Result Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Sheets API - Clear Sheet1": {
-      "main": [[{ "node": "Code - Build Sheets Write Chunks", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Code - Build Sheets Write Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Code - Build Sheets Write Chunks": {
-      "main": [[{ "node": "Sheets API - Write Roster Chunk", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Sheets API - Write Roster Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Sheets API - Write Roster Chunk": {
-      "main": [[{ "node": "Code - Refresh Complete", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Code - Refresh Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": false,
