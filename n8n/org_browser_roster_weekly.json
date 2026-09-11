@@ -1,0 +1,377 @@
+{
+  "name": "Org Browser Roster - Weekly Monday 4AM Arizona",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        352
+      ],
+      "id": "b1-0001",
+      "name": "Run Refresh Manually"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 4 * * 1"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        544
+      ],
+      "id": "b1-0002",
+      "name": "Weekly - Mondays 4:00 AM Arizona"
+    },
+    {
+      "parameters": {
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values/Sheet1!1:1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        448
+      ],
+      "id": "b1-0003",
+      "name": "Sheets API - Read Header Row",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Org Browser roster, rebuilt from the HR source that actually backs the\n-- Org Browser export. Column mapping was decoded from your own exports\n-- (org_browser_search_report_*.csv) against the csn_hr schema.\n--\n-- VERIFIED sources (internal docs \"Org Designer - Talent\", \"GM ACCESS\",\n-- \"SupportHub Metrics - SQL Repo\", \"SDQ Scripts: SQL-->BQ\"):\n--   tbl_employee              EmID EmFirstName EmLastName EmHRISID EmExtension\n--                             EmEmailAddress EmSamAccountName EmStartDate\n--                             EmSeniorityDate EmForecastEndDate EmBirthday\n--                             EmWgID EmEtpID EmTltID EmEmlID EmMgrID\n--                             EmShirtSize EmActive\n--   tblpl_workgroup           WgID WgName\n--   tbl_job_title             TltID TltName TltRnkID\n--   tblpl_employee_rank       RnkID RnkLevel\n--   tblpl_employee_location   EmlID EmlName EmlEprID\n--   tblpl_employee_type       EtpID EtpName\n--   tblpl_employee_profile    EprID EprName\n--\n-- NOT yet sourced, so they arrive blank in the sheet: Parent Work Group,\n-- Work Group 1..10/20, Headcount Classification, Home Department,\n-- Reporting VP, Reporting Senior VP, Term Date. See the README sticky note.\n--\n-- If you repoint this at wf-gcp-us-ae-bulk-prod.csn_hr.tbl_employee instead,\n-- that copy is a dated snapshot: add\n--   AND e.event_date = (SELECT MAX(event_date) FROM <same table>)\n-- or you will get one row per employee per day.\n\nSELECT\n  CAST(e.EmID AS STRING)                                  AS employee_id,\n  TRIM(COALESCE(CAST(e.EmFirstName AS STRING), ''))       AS preferred_first_name,\n  TRIM(COALESCE(CAST(e.EmLastName AS STRING), ''))        AS preferred_last_name,\n  CAST(e.EmHRISID AS STRING)                              AS hris_id,\n  TRIM(COALESCE(CAST(e.EmExtension AS STRING), ''))       AS phone_extension,\n  LOWER(TRIM(COALESCE(CAST(e.EmEmailAddress AS STRING), ''))) AS email_address,\n  TRIM(COALESCE(CAST(e.EmSamAccountName AS STRING), ''))  AS sam_account_name,\n  TRIM(COALESCE(CAST(loc.EmlName AS STRING), ''))         AS office_location,\n  IFNULL(FORMAT_DATE('%m/%d/%Y', SAFE_CAST(e.EmStartDate AS DATE)), '')      AS start_date,\n  IFNULL(FORMAT_DATE('%m/%d/%Y', SAFE_CAST(e.EmSeniorityDate AS DATE)), '')  AS seniority_date,\n  IFNULL(FORMAT_DATE('%m/%d/%Y', SAFE_CAST(e.EmForecastEndDate AS DATE)), '') AS forecast_end_date,\n  IFNULL(FORMAT_DATE('%b %d', SAFE_CAST(e.EmBirthday AS DATE)), '')          AS birthday,\n  CAST(e.EmWgID AS STRING)                                AS work_group_id,\n  TRIM(COALESCE(CAST(wg.WgName AS STRING), ''))           AS work_group,\n  TRIM(COALESCE(CAST(etp.EtpName AS STRING), ''))         AS employee_type,\n  TRIM(COALESCE(CAST(epr.EprName AS STRING), ''))         AS employee_profile,\n  TRIM(COALESCE(CAST(jt.TltName AS STRING), ''))          AS job_title,\n  CAST(rnk.RnkLevel AS STRING)                            AS level,\n  CAST(e.EmMgrID AS STRING)                               AS manager_employee_id,\n  -- Org Browser renders manager names as \"Last, First\"\n  TRIM(CONCAT(\n    TRIM(COALESCE(CAST(m.EmLastName AS STRING), '')), ', ',\n    TRIM(COALESCE(CAST(m.EmFirstName AS STRING), ''))\n  ))                                                      AS manager_name,\n  CAST(m.EmHRISID AS STRING)                              AS manager_hris_id,\n  TRIM(COALESCE(CAST(mwg.WgName AS STRING), ''))          AS manager_work_group,\n  CAST(m.EmMgrID AS STRING)                               AS manager2_employee_id,\n  TRIM(CONCAT(\n    TRIM(COALESCE(CAST(m2.EmLastName AS STRING), '')), ', ',\n    TRIM(COALESCE(CAST(m2.EmFirstName AS STRING), ''))\n  ))                                                      AS manager2_name,\n  CAST(m2.EmHRISID AS STRING)                             AS manager2_hris_id,\n  TRIM(COALESCE(CAST(e.EmShirtSize AS STRING), ''))       AS shirt_size\nFROM `wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_employee` AS e\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_workgroup`  AS wg   ON wg.WgID   = e.EmWgID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_job_title`  AS jt   ON jt.TltID  = e.EmTltID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_employee_rank` AS rnk  ON rnk.RnkID = jt.TltRnkID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_employee_location` AS loc  ON loc.EmlID = e.EmEmlID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_employee_profile` AS epr  ON epr.EprID = loc.EmlEprID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_employee_type` AS etp  ON etp.EtpID = e.EmEtpID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_employee`  AS m    ON m.EmID    = e.EmMgrID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_workgroup`  AS mwg  ON mwg.WgID  = m.EmWgID\nLEFT JOIN `wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_employee`  AS m2   ON m2.EmID   = m.EmMgrID\nWHERE e.EmActive IS TRUE\n  AND e.EmID IS NOT NULL\n-- Defensive: guarantees one row per employee even if the source copy is snapshotted\nQUALIFY ROW_NUMBER() OVER (PARTITION BY e.EmID ORDER BY e.EmID) = 1\nORDER BY preferred_last_name, preferred_first_name",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        448
+      ],
+      "id": "b1-0004",
+      "name": "BigQuery - Pull Org Browser Roster",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map the BigQuery result onto the column order ALREADY IN THE SHEET.\n// Row 1 of the sheet is the contract: it is read at runtime, never rewritten.\n// A header we cannot source yet simply comes back blank, so adding a source\n// later means changing only the SQL and this one table.\n\nconst HEADER_TO_FIELD = {\n  'Employee ID': 'employee_id',\n  'Preferred First Name': 'preferred_first_name',\n  'Preferred Last Name': 'preferred_last_name',\n  'HRIS ID': 'hris_id',\n  'Phone Extension': 'phone_extension',\n  'Email Address': 'email_address',\n  'Sam Account Name': 'sam_account_name',\n  'Office Location': 'office_location',\n  'Start Date': 'start_date',\n  'Seniority Date': 'seniority_date',\n  'Forecast End Date': 'forecast_end_date',\n  'Birthday': 'birthday',\n  'Work Group ID': 'work_group_id',\n  'Work Group': 'work_group',\n  'Employee Type': 'employee_type',\n  'Employee Profile': 'employee_profile',\n  'Job Title': 'job_title',\n  'Level': 'level',\n  \"Manager's Employee ID\": 'manager_employee_id',\n  \"Manager's Name\": 'manager_name',\n  \"Manager's HRIS ID\": 'manager_hris_id',\n  \"Manager's Work Group\": 'manager_work_group',\n  \"2nd Level Manager's Employee ID\": 'manager2_employee_id',\n  \"2nd Level Manager's Name\": 'manager2_name',\n  \"2nd Level Manager's HRIS ID\": 'manager2_hris_id',\n  'Shirt Size': 'shirt_size',\n};\n\n// Sheet headers arrive with stray leading spaces and sometimes curly quotes.\nconst normalize = (h) => String(h == null ? '' : h)\n  .replace(/[‘’]/g, \"'\")\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst headerResponse = $('Sheets API - Read Header Row').first().json || {};\nconst headerRow = (headerResponse.values && headerResponse.values[0]) || [];\n\nconst rows = $input.all()\n  .map((item) => item.json || {})\n  .filter((row) => Object.keys(row).length > 0);\n\nconst toText = (v) => {\n  if (v === null || v === undefined) return '';\n  if (typeof v === 'object') return JSON.stringify(v);\n  return String(v);\n};\n\n// Resolve each sheet column to a source field. Duplicated headers (the export\n// repeats Preferred Last Name / Preferred First Name) resolve to the same field.\nconst filled = [];\nconst blank = [];\nconst plan = headerRow.map((raw) => {\n  const key = normalize(raw);\n  const field = HEADER_TO_FIELD[key] || null;\n  if (key === '') return null;\n  if (field) filled.push(key); else blank.push(key);\n  return field;\n});\n\nif (headerRow.length === 0) {\n  return [{ json: { row_count: 0, header_error: true, records: [],\n    message: 'Row 1 of the sheet is empty. Paste the Org Browser header row into row 1 first - the workflow maps onto it and will not invent one.' } }];\n}\n\nconst records = rows.map((row) => plan.map((field) => (field ? toText(row[field]) : '')));\n\nreturn [{ json: {\n  row_count: records.length,\n  column_count: headerRow.length,\n  records,\n  headers_filled: [...new Set(filled)],\n  headers_left_blank: [...new Set(blank)],\n  header_error: false,\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        448
+      ],
+      "id": "b1-0005",
+      "name": "Code - Map Roster To Sheet Columns"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.row_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        448
+      ],
+      "id": "b1-0006",
+      "name": "IF - Roster Returned Rows"
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ $json.header_error ? $json.message : 'ROSTER REFRESH ABORTED - BigQuery returned zero rows. The sheet was NOT cleared and row 1 is intact. Most likely the BigQuery credential lacks read access to the csn_hr dataset (the previous credential was scoped to cs_prod). Verify with: SELECT COUNT(*) FROM `wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_employee` WHERE EmActive IS TRUE' }}"
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        640
+      ],
+      "id": "b1-0007",
+      "name": "Stop and Error - Empty Result Guard"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values/Sheet1!A2:BZ:clear",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        448
+      ],
+      "id": "b1-0008",
+      "name": "Sheets API - Clear Data Rows Only",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One values:batchUpdate body per chunk, written from row 2 down.\n// Row 1 (the header row you pasted) is never written to.\nconst TAB_NAME = 'Sheet1';\nconst CHUNK_ROWS = 5000;\nconst FIRST_DATA_ROW = 2;\n\nconst source = $('Code - Map Roster To Sheet Columns').first().json;\nconst records = source.records || [];\nconst chunks = [];\n\nfor (let offset = 0; offset < records.length; offset += CHUNK_ROWS) {\n  const slice = records.slice(offset, offset + CHUNK_ROWS);\n  const startRow = FIRST_DATA_ROW + offset;\n  chunks.push({\n    chunk_index: chunks.length + 1,\n    chunk_rows: slice.length,\n    start_row: startRow,\n    request_body: {\n      valueInputOption: 'RAW',\n      data: [{ range: `${TAB_NAME}!A${startRow}`, majorDimension: 'ROWS', values: slice }],\n    },\n  });\n}\n\nreturn chunks.map((c) => ({ json: { ...c, chunk_total: chunks.length } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        448
+      ],
+      "id": "b1-0009",
+      "name": "Code - Build Sheets Write Chunks"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.request_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        448
+      ],
+      "id": "b1-0010",
+      "name": "Sheets API - Write Roster Chunk",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $('Code - Map Roster To Sheet Columns').first().json;\nconst chunks = $('Code - Build Sheets Write Chunks').all();\n\nreturn [{ json: {\n  status: 'SUCCESS',\n  spreadsheet_id: '1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4',\n  spreadsheet_name: 'Org Broswer N8N Refresh Mondays',\n  tab_name: 'Sheet1',\n  employee_row_count: source.row_count,\n  sheet_column_count: source.column_count,\n  header_row_preserved: true,\n  columns_populated: source.headers_filled,\n  columns_left_blank: source.headers_left_blank,\n  sheets_write_requests_used: chunks.length + 1,\n  schedule: 'Mondays 04:00 America/Phoenix (Arizona, no DST) = 11:00 UTC',\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        448
+      ],
+      "id": "b1-0011",
+      "name": "Code - Refresh Complete",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## Org Browser Roster - Weekly Monday 4AM Arizona\n\nAutomates the manual `org_browser_search_report_*.csv` export into the sheet.\n\n### Row 1 is the contract\nThe workflow READS row 1 of the tab and maps its query onto those column names. It never writes row 1 and never clears it. Reorder or rename columns in the sheet and the workflow follows. A header it cannot source yet is left blank rather than guessed at.\n\n### Source\n`wf-gcp-us-ae-sql-data-prod.csn_hr.tbl_employee` joined to tblpl_workgroup, tbl_job_title, tblpl_employee_rank, tblpl_employee_location, tblpl_employee_profile, tblpl_employee_type, plus two self-joins for the manager chain. Mapping decoded from your own exports and cross-checked against internal schema docs.\n\nNOT the CS performance table - that table has no Shirt Size, Birthday, HRIS ID, Sam Account Name, Job Title or Level, so it can never fill this header row.\n\n### 26 of 45 columns are populated\nBlank until a source is confirmed: Parent Work Group, Work Group 1-10 and 20, Headcount Classification, Home Department, Reporting VP, Reporting Senior VP, Term Date.\n\nWork Group 1..20 is the workgroup ancestor path formatted `Name (ID)`. Filling it needs the parent-workgroup column on tblpl_workgroup, whose name is not yet verified. Run `SELECT * FROM wf-gcp-us-ae-sql-data-prod.csn_hr.tblpl_workgroup LIMIT 1` and send me the column list - that unlocks Parent Work Group and all 11 Work Group columns at once.\n\nHeadcount Classification needs WgID -> tbl_join_workgroup_netsuite_department -> tblpl_netsuite_department -> tblpl_netsuite_head_count_classification. Column names are known but they sit in a different project, so access needs confirming.\n\n### Scope\nCurrently ALL active Wayfair employees (EmActive IS TRUE), matching an unfiltered Org Browser export. Your saved reports look scoped to the Service org. To narrow it, add a workgroup or manager-chain predicate to the WHERE clause.\n\n### Schedule\nWorkflow timezone `America/Phoenix`, cron `0 4 * * 1`. Arizona skips DST so this is 11:00 UTC year-round. Confirm the timezone in Workflow Settings after import.\n\n### Safety\nZero rows from BigQuery means the sheet is NOT cleared and the run fails loudly. An empty row 1 also fails loudly instead of inventing headers. Only A2 downward is ever cleared or written.\n\n### After import\nSelect credentials on the BigQuery node and both Sheets HTTP nodes. The BigQuery credential needs read access to the csn_hr dataset - the previous credential was scoped to cs_prod, so this may need a grant.",
+        "height": 880,
+        "width": 760,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -820,
+        100
+      ],
+      "id": "b1-0012",
+      "name": "README"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run Refresh Manually": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Read Header Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly - Mondays 4:00 AM Arizona": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Read Header Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets API - Read Header Row": {
+      "main": [
+        [
+          {
+            "node": "BigQuery - Pull Org Browser Roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Pull Org Browser Roster": {
+      "main": [
+        [
+          {
+            "node": "Code - Map Roster To Sheet Columns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Map Roster To Sheet Columns": {
+      "main": [
+        [
+          {
+            "node": "IF - Roster Returned Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Roster Returned Rows": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Clear Data Rows Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop and Error - Empty Result Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets API - Clear Data Rows Only": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Sheets Write Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Build Sheets Write Chunks": {
+      "main": [
+        [
+          {
+            "node": "Sheets API - Write Roster Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets API - Write Roster Chunk": {
+      "main": [
+        [
+          {
+            "node": "Code - Refresh Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timezone": "America/Phoenix",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "versionId": "c4a90e21-77b5-4d38-9f60-1e2b8c05aa77",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "03eaefce1798e2883471ae7d5d2dfbc186343411ac19c565c97d8bae537d45f1"
+  },
+  "nodeGroups": [],
+  "id": "OrgBrowserRosterHR1",
+  "tags": []
+}

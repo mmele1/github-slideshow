@@ -35,7 +35,7 @@
     {
       "parameters": {
         "projectId": "wf-gcp-us-ae-gat-prod",
-        "sqlQuery": "-- Full Customer Service org roster: every active employee (agents) plus the\n-- complete management chain and org attributes on each row.\n--\n-- Source table is EMPLOYEE/DAY level (not manager level), so no join is needed.\n-- Verified column list: emid, employee, mgremid, manager, mgr2emid, manager2,\n-- srmgremid, srmanager, name, username, stillatwayfair, siteid, site,\n-- virtualflag, team, styid, subentity, regionid, region, typeofsite, wgid,\n-- workgroup, parentwgid, parentworkgroup, grandparentwgid,\n-- grandparentparentworkgroup, lastrundate, currentskilllevel, overallranking,\n-- topxpercent, skillranking, majorityskill, skill_1_start_date,\n-- skill_2_start_date, skill_3_start_date, hierarchylevel, emailaddress,\n-- mgremailaddress, TimePeriod, date, datetype, swapid, hiredate, daystenured,\n-- plus a long tail of *_to_goal performance metrics (excluded here on purpose --\n-- this is a directory, not a scorecard). To include them too, add them to the\n-- SELECT list; the downstream Code nodes build headers dynamically from whatever\n-- columns this query returns, so no other node needs to change.\n\n-- NOTE: every free-text column is wrapped in CAST(... AS STRING) before\n-- COALESCE. The source table's types do not match its SQL-era schema doc\n-- (e.g. majorityskill is INT64), so casting first keeps this query working\n-- regardless of the underlying type.\n\nWITH latest_snapshot AS (\n  SELECT MAX(date) AS snapshot_date\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 7 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n)\nSELECT\n  -- Employee / agent identity\n  CAST(t.emid AS STRING) AS `Employee ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.employee AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Employee Name`,\n  TRIM(COALESCE(CAST(t.name AS STRING), '')) AS `Employee Name Raw`,\n  LOWER(TRIM(COALESCE(CAST(t.username AS STRING), ''))) AS `Username`,\n  LOWER(TRIM(COALESCE(CAST(t.emailaddress AS STRING), ''))) AS `Employee Email`,\n  IF(t.stillatwayfair, 'Yes', 'No') AS `Active`,\n  CAST(t.hierarchylevel AS STRING) AS `Hierarchy Level`,\n  CAST(SAFE_CAST(t.hiredate AS DATE) AS STRING) AS `Hire Date`,\n  CAST(t.daystenured AS STRING) AS `Days Tenured`,\n\n  -- Management chain\n  CAST(t.mgremid AS STRING) AS `Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager Name`,\n  LOWER(TRIM(COALESCE(CAST(t.mgremailaddress AS STRING), ''))) AS `Manager Email`,\n  CAST(t.mgr2emid AS STRING) AS `Manager 2 ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager2 AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager 2 Name`,\n  CAST(t.srmgremid AS STRING) AS `Senior Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.srmanager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Senior Manager Name`,\n\n  -- Workgroup hierarchy\n  TRIM(COALESCE(CAST(t.team AS STRING), '')) AS `Team`,\n  CAST(t.wgid AS STRING) AS `Workgroup ID`,\n  TRIM(COALESCE(CAST(t.workgroup AS STRING), '')) AS `Workgroup`,\n  CAST(t.parentwgid AS STRING) AS `Parent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.parentworkgroup AS STRING), '')) AS `Parent Workgroup`,\n  CAST(t.grandparentwgid AS STRING) AS `Grandparent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.grandparentparentworkgroup AS STRING), '')) AS `Grandparent Workgroup`,\n\n  -- Site / geography\n  CAST(t.siteid AS STRING) AS `Site ID`,\n  TRIM(COALESCE(CAST(t.site AS STRING), '')) AS `Site`,\n  TRIM(COALESCE(CAST(t.typeofsite AS STRING), '')) AS `Site Type`,\n  CAST(t.virtualflag AS STRING) AS `Virtual Flag`,\n  TRIM(COALESCE(CAST(t.subentity AS STRING), '')) AS `Subentity`,\n  CAST(t.regionid AS STRING) AS `Region ID`,\n  TRIM(COALESCE(CAST(t.region AS STRING), '')) AS `Region`,\n\n  -- Skill / ranking attributes\n  CAST(t.currentskilllevel AS STRING) AS `Current Skill Level`,\n  TRIM(COALESCE(CAST(t.majorityskill AS STRING), '')) AS `Majority Skill`,\n  CAST(t.skillranking AS STRING) AS `Skill Ranking`,\n  CAST(t.overallranking AS STRING) AS `Overall Ranking`,\n  CAST(t.topxpercent AS STRING) AS `Top X Percent`,\n  CAST(SAFE_CAST(t.skill_1_start_date AS DATE) AS STRING) AS `Skill 1 Start Date`,\n  CAST(SAFE_CAST(t.skill_2_start_date AS DATE) AS STRING) AS `Skill 2 Start Date`,\n  CAST(SAFE_CAST(t.skill_3_start_date AS DATE) AS STRING) AS `Skill 3 Start Date`,\n\n  -- Record metadata\n  CAST(t.styid AS STRING) AS `Style ID`,\n  CAST(t.swapid AS STRING) AS `Swap ID`,\n  CAST(SAFE_CAST(t.lastrundate AS DATE) AS STRING) AS `Last Run Date`,\n  CAST(s.snapshot_date AS STRING) AS `Snapshot Date`,\n  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP(), 'America/Phoenix') AS `Refreshed At Arizona`\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\nCROSS JOIN latest_snapshot AS s\nWHERE t.datetype = 'Day'\n  AND t.date = s.snapshot_date\n  AND t.stillatwayfair IS TRUE\n  AND t.emid IS NOT NULL\n-- One row per employee even if the source carries multiple TimePeriod rows per day\nQUALIFY ROW_NUMBER() OVER (PARTITION BY t.emid ORDER BY t.lastrundate DESC, t.mgremid) = 1\nORDER BY `Senior Manager Name`, `Manager Name`, `Employee Name`",
+        "sqlQuery": "-- Full Customer Service org roster: every active employee (agents) plus the\n-- complete management chain and org attributes on each row.\n--\n-- Source table is EMPLOYEE/DAY level (not manager level), so no join is needed.\n-- Verified column list: emid, employee, mgremid, manager, mgr2emid, manager2,\n-- srmgremid, srmanager, name, username, stillatwayfair, siteid, site,\n-- virtualflag, team, styid, subentity, regionid, region, typeofsite, wgid,\n-- workgroup, parentwgid, parentworkgroup, grandparentwgid,\n-- grandparentparentworkgroup, lastrundate, currentskilllevel, overallranking,\n-- topxpercent, skillranking, majorityskill, skill_1_start_date,\n-- skill_2_start_date, skill_3_start_date, hierarchylevel, emailaddress,\n-- mgremailaddress, TimePeriod, date, datetype, swapid, hiredate, daystenured,\n-- plus a long tail of *_to_goal performance metrics (excluded here on purpose --\n-- this is a directory, not a scorecard). To include them too, add them to the\n-- SELECT list; the downstream Code nodes build headers dynamically from whatever\n-- columns this query returns, so no other node needs to change.\n\n-- datetype = 'Day' is VERIFIED correct for this table (internal tickets\n-- SDS-767 and SDS-938 both use WHERE DateType = 'Day'). 'Month' also exists.\n-- hierarchylevel = 1 denotes L1 employees, exposed below as a column rather\n-- than filtered, so supervisors and managers stay in the directory.\n--\n-- The snapshot window is 30 days, not 400: wide enough to ride out a pipeline\n-- or holiday gap, narrow enough that genuinely stale data fails the run instead\n-- of being published to the sheet as if it were current.\n--\n-- NOTE: every free-text column is wrapped in CAST(... AS STRING) before\n-- COALESCE. The source table's types do not match its SQL-era schema doc\n-- (e.g. majorityskill is INT64), so casting first keeps this query working\n-- regardless of the underlying type.\n\nWITH latest_snapshot AS (\n  SELECT MAX(date) AS snapshot_date\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 30 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n)\nSELECT\n  -- Employee / agent identity\n  CAST(t.emid AS STRING) AS `Employee ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.employee AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Employee Name`,\n  TRIM(COALESCE(CAST(t.name AS STRING), '')) AS `Employee Name Raw`,\n  LOWER(TRIM(COALESCE(CAST(t.username AS STRING), ''))) AS `Username`,\n  LOWER(TRIM(COALESCE(CAST(t.emailaddress AS STRING), ''))) AS `Employee Email`,\n  IF(t.stillatwayfair, 'Yes', 'No') AS `Active`,\n  CAST(t.hierarchylevel AS STRING) AS `Hierarchy Level`,\n  CAST(SAFE_CAST(t.hiredate AS DATE) AS STRING) AS `Hire Date`,\n  CAST(t.daystenured AS STRING) AS `Days Tenured`,\n\n  -- Management chain\n  CAST(t.mgremid AS STRING) AS `Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager Name`,\n  LOWER(TRIM(COALESCE(CAST(t.mgremailaddress AS STRING), ''))) AS `Manager Email`,\n  CAST(t.mgr2emid AS STRING) AS `Manager 2 ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.manager2 AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager 2 Name`,\n  CAST(t.srmgremid AS STRING) AS `Senior Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(CAST(t.srmanager AS STRING), '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Senior Manager Name`,\n\n  -- Workgroup hierarchy\n  TRIM(COALESCE(CAST(t.team AS STRING), '')) AS `Team`,\n  CAST(t.wgid AS STRING) AS `Workgroup ID`,\n  TRIM(COALESCE(CAST(t.workgroup AS STRING), '')) AS `Workgroup`,\n  CAST(t.parentwgid AS STRING) AS `Parent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.parentworkgroup AS STRING), '')) AS `Parent Workgroup`,\n  CAST(t.grandparentwgid AS STRING) AS `Grandparent Workgroup ID`,\n  TRIM(COALESCE(CAST(t.grandparentparentworkgroup AS STRING), '')) AS `Grandparent Workgroup`,\n\n  -- Site / geography\n  CAST(t.siteid AS STRING) AS `Site ID`,\n  TRIM(COALESCE(CAST(t.site AS STRING), '')) AS `Site`,\n  TRIM(COALESCE(CAST(t.typeofsite AS STRING), '')) AS `Site Type`,\n  CAST(t.virtualflag AS STRING) AS `Virtual Flag`,\n  TRIM(COALESCE(CAST(t.subentity AS STRING), '')) AS `Subentity`,\n  CAST(t.regionid AS STRING) AS `Region ID`,\n  TRIM(COALESCE(CAST(t.region AS STRING), '')) AS `Region`,\n\n  -- Skill / ranking attributes\n  CAST(t.currentskilllevel AS STRING) AS `Current Skill Level`,\n  TRIM(COALESCE(CAST(t.majorityskill AS STRING), '')) AS `Majority Skill`,\n  CAST(t.skillranking AS STRING) AS `Skill Ranking`,\n  CAST(t.overallranking AS STRING) AS `Overall Ranking`,\n  CAST(t.topxpercent AS STRING) AS `Top X Percent`,\n  CAST(SAFE_CAST(t.skill_1_start_date AS DATE) AS STRING) AS `Skill 1 Start Date`,\n  CAST(SAFE_CAST(t.skill_2_start_date AS DATE) AS STRING) AS `Skill 2 Start Date`,\n  CAST(SAFE_CAST(t.skill_3_start_date AS DATE) AS STRING) AS `Skill 3 Start Date`,\n\n  -- Record metadata\n  CAST(t.styid AS STRING) AS `Style ID`,\n  CAST(t.swapid AS STRING) AS `Swap ID`,\n  TRIM(COALESCE(CAST(t.datetype AS STRING), '')) AS `Date Type`,\n  CAST(SAFE_CAST(t.lastrundate AS DATE) AS STRING) AS `Last Run Date`,\n  CAST(s.snapshot_date AS STRING) AS `Snapshot Date`,\n  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP(), 'America/Phoenix') AS `Refreshed At Arizona`\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\nCROSS JOIN latest_snapshot AS s\nWHERE t.datetype = 'Day'\n  AND t.date = s.snapshot_date\n  AND t.stillatwayfair IS TRUE\n  AND t.emid IS NOT NULL\n-- One row per employee even if the source carries multiple TimePeriod rows per day\nQUALIFY ROW_NUMBER() OVER (PARTITION BY t.emid ORDER BY t.lastrundate DESC, t.mgremid) = 1\nORDER BY `Senior Manager Name`, `Manager Name`, `Employee Name`",
         "options": {
           "useLegacySql": false
         }
@@ -107,13 +107,13 @@
     },
     {
       "parameters": {
-        "errorMessage": "BigQuery returned zero roster rows. The Google Sheet was NOT cleared, so the previous roster is preserved. Check that the source table has a daily snapshot in the last 7 days and that the BigQuery credential still has access."
+        "errorMessage": "={{ $json.diagnosis }}"
       },
       "type": "n8n-nodes-base.stopAndError",
       "typeVersion": 1,
       "position": [
-        960,
-        624
+        1680,
+        700
       ],
       "id": "7a1c0d10-0006-4a00-8a00-000000000006",
       "name": "Stop and Error - Empty Result Guard"
@@ -192,7 +192,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const source = $('Code - Normalize Roster').first().json;\nconst chunks = $('Code - Build Sheets Write Chunks').all();\n\nreturn [{\n  json: {\n    status: 'SUCCESS',\n    spreadsheet_id: '1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4',\n    spreadsheet_name: 'Org Broswer N8N Refresh Mondays',\n    tab_name: 'Sheet1',\n    employee_row_count: source.row_count,\n    distinct_manager_count: source.manager_count,\n    column_count: source.column_count,\n    columns_written: source.columns,\n    snapshot_date: source.snapshot_date,\n    sheets_write_requests_used: chunks.length + 1,\n    schedule: 'Mondays 04:00 America/Phoenix (Arizona, no DST) = 11:00 UTC',\n  },\n}];"
+        "jsCode": "const source = $('Code - Normalize Roster').first().json;\nconst chunks = $('Code - Build Sheets Write Chunks').all();\n\nreturn [{\n  json: {\n    status: 'SUCCESS',\n    spreadsheet_id: '1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4',\n    spreadsheet_name: 'Org Broswer N8N Refresh Mondays',\n    tab_name: 'Sheet1',\n    employee_row_count: source.row_count,\n    distinct_manager_count: source.manager_count,\n    column_count: source.column_count,\n    columns_written: source.columns,\n    snapshot_date: source.snapshot_date,\n    snapshot_age_days: source.snapshot_date\n      ? Math.round((Date.now() - Date.parse(source.snapshot_date)) / 86400000)\n      : null,\n    sheets_write_requests_used: chunks.length + 1,\n    schedule: 'Mondays 04:00 America/Phoenix (Arizona, no DST) = 11:00 UTC',\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -207,7 +207,7 @@
     {
       "parameters": {
         "content": "## Org Browser Full Roster - Weekly Monday 4AM Arizona\n\nStandalone. Does not touch the TM PDP/ROD/PIP workflow. No documents generated, no emails sent.\n\n### What it writes\nEvery ACTIVE Customer Service employee (agents) as one row, with the full management chain (Manager / Manager 2 / Senior Manager), workgroup hierarchy, site, region, and skill attributes. The previous version of this workflow used SELECT DISTINCT on manager fields only, which collapsed agents out of the result.\n\nSource: `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` (employee/day level, so no join needed).\n\n### Schedule\nWorkflow timezone is set to `America/Phoenix`, cron `0 4 * * 1`. Arizona does not observe DST, so this is 11:00 UTC year-round. CONFIRM the timezone in Workflow Settings after import - if the instance default overrides it, the run will drift.\n\n### Safety\nIf BigQuery returns zero rows the sheet is NOT cleared and the run fails loudly, so a bad query can never blank the directory.\n\nThe query takes the most recent daily snapshot in the last 7 days rather than hard-coding yesterday, so a missing Sunday snapshot does not produce an empty Monday run.\n\n### To change the destination\nSpreadsheet ID and tab name appear in 4 places: the two HTTP Request node URLs, `TAB_NAME` in Code - Build Sheets Write Chunks, and the summary in Code - Refresh Complete.\n\n### After import\nSelect your BigQuery and Google Sheets OAuth credentials on the three credentialed nodes, run manually once, then activate.",
-        "height": 640,
+        "height": 760,
         "width": 740,
         "color": 4
       },
@@ -219,6 +219,44 @@
       ],
       "id": "7a1c0d10-0011-4a00-8a00-000000000011",
       "name": "README"
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Runs ONLY when the roster query returned zero rows.\n-- One pass over 400 days answers every question at once: which datetype\n-- literals exist, how fresh the data actually is, and whether any rows are\n-- flagged active. Scans a handful of columns, so it is cheap.\nSELECT\n  TRIM(COALESCE(CAST(datetype AS STRING), '(null)')) AS datetype_value,\n  COUNT(*) AS row_count,\n  COUNT(DISTINCT emid) AS distinct_employees,\n  CAST(MIN(date) AS STRING) AS min_date,\n  CAST(MAX(date) AS STRING) AS max_date,\n  DATE_DIFF(CURRENT_DATE('America/Phoenix'), MAX(date), DAY) AS days_since_last_snapshot,\n  COUNTIF(COALESCE(stillatwayfair, FALSE)) AS active_rows\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\nWHERE date >= DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 400 DAY)\nGROUP BY datetype_value\nORDER BY row_count DESC\nLIMIT 25",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        1200,
+        700
+      ],
+      "id": "7a1c0d10-0012-4a00-8a00-000000000012",
+      "name": "BigQuery - Diagnose Empty Result",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the diagnostic rows into a single actionable error message.\nconst rows = $input.all()\n  .map((item) => item.json || {})\n  .filter((row) => Object.keys(row).length > 0);\n\nconst L = [];\nL.push('ROSTER REFRESH ABORTED - BigQuery returned zero rows.');\nL.push('The Google Sheet was NOT cleared. The previous roster is intact.');\nL.push('');\n\nif (rows.length === 0) {\n  L.push('DIAGNOSIS: the source table has NO rows at all in the last 400 days.');\n  L.push('');\n  L.push('That means this table is no longer being populated, or the BigQuery');\n  L.push('credential has lost access to it.');\n  L.push('  Table: wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager');\n  L.push('');\n  L.push('NEXT STEP: confirm the table is still maintained. If it was retired,');\n  L.push('the likely replacement is:');\n  L.push('  wf-gcp-us-ae-gat-prod.ops_reporting_layer.vw_customer_service_master_reporting');\n  L.push('  (employee_id, employee_name, employee_workgroup_name, employee_working_team, ...)');\n} else {\n  const day = rows.find((r) => String(r.datetype_value).toLowerCase() === 'day');\n  L.push('The table DOES have data. Breakdown by datetype over the last 400 days:');\n  L.push('');\n  for (const r of rows) {\n    L.push(`  datetype=\"${r.datetype_value}\" | rows=${r.row_count} | employees=${r.distinct_employees} | ` +\n           `dates ${r.min_date} -> ${r.max_date} | ${r.days_since_last_snapshot}d stale | active=${r.active_rows}`);\n  }\n  L.push('');\n  if (!day) {\n    L.push('DIAGNOSIS: no rows with datetype=\"Day\". The roster query filters on it.');\n    L.push('NEXT STEP: change the datetype filter to one of the values listed above.');\n  } else if (Number(day.days_since_last_snapshot) > 30) {\n    L.push(`DIAGNOSIS: the newest \"Day\" snapshot is ${day.days_since_last_snapshot} days old ` +\n           '(${day.max_date}), outside the 30-day window the roster query allows.');\n    L.push('The window is deliberately narrow so stale data is never published as current.');\n    L.push('NEXT STEP: fix the upstream pipeline, or - if this table was retired - repoint');\n    L.push('the query at the current source. Widening the window would publish stale data.');\n  } else if (Number(day.active_rows) === 0) {\n    L.push('DIAGNOSIS: \"Day\" rows exist and are fresh, but ZERO have stillatwayfair = TRUE.');\n    L.push('NEXT STEP: the active-employee flag is not being set. Either fix upstream or');\n    L.push('drop \"AND t.stillatwayfair IS TRUE\" from the roster query to load everyone.');\n  } else {\n    L.push('DIAGNOSIS: fresh, active \"Day\" rows exist, so the date/datetype/active filters');\n    L.push('are not the cause. The remaining difference is the QUALIFY dedupe or the');\n    L.push('exact-match on the snapshot date.');\n    L.push(`NEXT STEP: run the roster query with \"AND t.date = DATE '${day.max_date}'\"`);\n    L.push('substituted for the latest_snapshot CROSS JOIN and compare.');\n  }\n}\n\nreturn [{ json: { diagnosis: L.join('\\n'), diagnostic_rows: rows } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        700
+      ],
+      "id": "7a1c0d10-0013-4a00-8a00-000000000013",
+      "name": "Code - Explain Empty Result"
     }
   ],
   "pinData": {},
@@ -278,7 +316,7 @@
         ],
         [
           {
-            "node": "Stop and Error - Empty Result Guard",
+            "node": "BigQuery - Diagnose Empty Result",
             "type": "main",
             "index": 0
           }
@@ -312,6 +350,28 @@
         [
           {
             "node": "Code - Refresh Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Diagnose Empty Result": {
+      "main": [
+        [
+          {
+            "node": "Code - Explain Empty Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Explain Empty Result": {
+      "main": [
+        [
+          {
+            "node": "Stop and Error - Empty Result Guard",
             "type": "main",
             "index": 0
           }
