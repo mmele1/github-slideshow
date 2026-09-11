@@ -1,0 +1,150 @@
+{
+  "name": "Schema Probe - Everyone-Level Roster Sources",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "id": "p-01",
+      "name": "Run Refresh Manually"
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Free: INFORMATION_SCHEMA is metadata only, it scans no table data.\nSELECT\n  'ops_reporting_layer.vw_customer_service_master_reporting' AS source,\n  ordinal_position,\n  column_name,\n  data_type\nFROM `wf-gcp-us-ae-gat-prod.ops_reporting_layer.INFORMATION_SCHEMA.COLUMNS`\nWHERE table_name = 'vw_customer_service_master_reporting'\nORDER BY ordinal_position",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        240,
+        300
+      ],
+      "id": "p-02",
+      "name": "BigQuery - Schema A - master reporting",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Free: INFORMATION_SCHEMA is metadata only, it scans no table data.\nSELECT\n  'cs_datawarehouse.vw_dim_employee_detail' AS source,\n  ordinal_position,\n  column_name,\n  data_type\nFROM `wf-gcp-us-ae-cs-prod.cs_datawarehouse.INFORMATION_SCHEMA.COLUMNS`\nWHERE table_name = 'vw_dim_employee_detail'\nORDER BY ordinal_position",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        300
+      ],
+      "id": "p-03",
+      "name": "BigQuery - Schema B - dim employee detail",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "executeOnce": true,
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format both candidate schemas into one readable report.\n// Highlights the columns needed to build an everyone-level roster.\nconst WANT = {\n  identity: ['employee_id', 'employee_name', 'employee_login_username', 'emid', 'employee', 'name', 'username'],\n  email: ['email', 'emailaddress', 'employee_email', 'employee_email_address'],\n  manager: ['manager', 'mgr', 'supervisor', 'leader'],\n  date: ['date', 'snapshot', 'event_date', 'employee_date', 'reporting_date', 'datevalue'],\n  workgroup: ['workgroup', 'wgid', 'wg_id', 'team', 'org'],\n  active: ['active', 'still', 'is_current', 'currentflag', 'terminat'],\n  level: ['level', 'rank', 'hierarchy', 'title', 'job'],\n};\n\nconst collect = (nodeName) => {\n  try {\n    return $(nodeName).all().map((i) => i.json || {}).filter((r) => r.column_name);\n  } catch (e) {\n    return [];\n  }\n};\n\nconst sets = [\n  ['gat-prod.ops_reporting_layer.vw_customer_service_master_reporting', collect('BigQuery - Schema A - master reporting')],\n  ['cs-prod.cs_datawarehouse.vw_dim_employee_detail', collect('BigQuery - Schema B - dim employee detail')],\n];\n\nconst L = [];\nL.push('CANDIDATE SOURCE SCHEMAS for an everyone-level roster');\nL.push('');\n\nfor (const [label, rows] of sets) {\n  L.push('='.repeat(70));\n  L.push(label);\n  L.push('='.repeat(70));\n  if (rows.length === 0) {\n    L.push('  NO ACCESS or view does not exist - zero columns returned.');\n    L.push('');\n    continue;\n  }\n  L.push(`  ${rows.length} columns.`);\n  L.push('');\n  for (const [group, needles] of Object.entries(WANT)) {\n    const hits = rows\n      .filter((r) => needles.some((n) => String(r.column_name).toLowerCase().includes(n)))\n      .map((r) => `${r.column_name} (${r.data_type})`);\n    L.push(`  ${group.toUpperCase()}:`);\n    if (hits.length === 0) L.push('    none found');\n    else for (const h of hits) L.push(`    ${h}`);\n  }\n  L.push('');\n  L.push('  ALL COLUMNS:');\n  for (const r of rows) L.push(`    ${r.ordinal_position}. ${r.column_name} (${r.data_type})`);\n  L.push('');\n}\n\nL.push('='.repeat(70));\nL.push('Paste this whole report back to finish the everyone-level roster.');\n\nconst report = L.join('\\n');\nreturn [{ json: {\n  report,\n  master_reporting_column_count: sets[0][1].length,\n  dim_employee_detail_column_count: sets[1][1].length,\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ],
+      "id": "p-04",
+      "name": "Code - Build Schema Report",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## Schema probe - run once, then discard\n\nThe CS performance table CANNOT produce an everyone-level roster. Proven on snapshot 2026-09-10: emid is NULL across all 128,694 'Day' rows, and only 39 of 20,599 active Frontline rows carry any usable identity. employee, name and site are empty too. No filter change makes agents appear.\n\nThis probe reads the COLUMN LISTS of the two candidate sources that can. It is free - INFORMATION_SCHEMA is metadata, it scans no table data - and it writes NOTHING to your Google Sheet, so your current roster is untouched.\n\n### How to use\n1. Import, select the BigQuery credential on both BigQuery nodes.\n2. Click Run Refresh Manually.\n3. Open the LAST node, Code - Build Schema Report, and copy the `report` value.\n4. Paste it back.\n\nBoth BigQuery nodes are set to continue on error, so if one view is inaccessible the probe still reports on the other rather than failing.\n\n### Why a probe instead of just writing the query\nThe documented column list for the master reporting view covers identity and workgroup fields but not its DATE column or its MANAGER columns. Guessing a date column wrong on an agent/day view either errors or triggers a full scan of a very large table. One free metadata query removes that risk entirely.",
+        "height": 560,
+        "width": 700,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        60
+      ],
+      "id": "p-05",
+      "name": "README"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run Refresh Manually": {
+      "main": [
+        [
+          {
+            "node": "BigQuery - Schema A - master reporting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Schema A - master reporting": {
+      "main": [
+        [
+          {
+            "node": "BigQuery - Schema B - dim employee detail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BigQuery - Schema B - dim employee detail": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Schema Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timezone": "America/Phoenix",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "versionId": "a7e30b94-5d21-4c88-b6f1-93ad2e77c401",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "03eaefce1798e2883471ae7d5d2dfbc186343411ac19c565c97d8bae537d45f1"
+  },
+  "nodeGroups": [],
+  "id": "SchemaProbeRoster1",
+  "tags": []
+}
