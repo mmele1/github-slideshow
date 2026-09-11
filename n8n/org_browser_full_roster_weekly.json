@@ -1,0 +1,239 @@
+{
+  "name": "Org Browser Full Roster - Weekly Monday 4AM Arizona",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 352],
+      "id": "7a1c0d10-0001-4a00-8a00-000000000001",
+      "name": "Run Refresh Manually"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 4 * * 1"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 544],
+      "id": "7a1c0d10-0002-4a00-8a00-000000000002",
+      "name": "Weekly - Mondays 4:00 AM Arizona"
+    },
+    {
+      "parameters": {
+        "projectId": "wf-gcp-us-ae-gat-prod",
+        "sqlQuery": "-- Full Customer Service org roster: every active employee (agents) plus the\n-- complete management chain and org attributes on each row.\n--\n-- Source table is EMPLOYEE/DAY level (not manager level), so no join is needed.\n-- Verified column list: emid, employee, mgremid, manager, mgr2emid, manager2,\n-- srmgremid, srmanager, name, username, stillatwayfair, siteid, site,\n-- virtualflag, team, styid, subentity, regionid, region, typeofsite, wgid,\n-- workgroup, parentwgid, parentworkgroup, grandparentwgid,\n-- grandparentparentworkgroup, lastrundate, currentskilllevel, overallranking,\n-- topxpercent, skillranking, majorityskill, skill_1_start_date,\n-- skill_2_start_date, skill_3_start_date, hierarchylevel, emailaddress,\n-- mgremailaddress, TimePeriod, date, datetype, swapid, hiredate, daystenured,\n-- plus a long tail of *_to_goal performance metrics (excluded here on purpose --\n-- this is a directory, not a scorecard). To include them too, add them to the\n-- SELECT list; the downstream Code nodes build headers dynamically from whatever\n-- columns this query returns, so no other node needs to change.\n\nWITH latest_snapshot AS (\n  SELECT MAX(date) AS snapshot_date\n  FROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager`\n  WHERE datetype = 'Day'\n    AND date BETWEEN DATE_SUB(CURRENT_DATE('America/Phoenix'), INTERVAL 7 DAY)\n                 AND CURRENT_DATE('America/Phoenix')\n)\nSELECT\n  -- Employee / agent identity\n  CAST(t.emid AS STRING) AS `Employee ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.employee, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Employee Name`,\n  TRIM(COALESCE(t.name, '')) AS `Employee Name Raw`,\n  LOWER(TRIM(COALESCE(t.username, ''))) AS `Username`,\n  LOWER(TRIM(COALESCE(t.emailaddress, ''))) AS `Employee Email`,\n  IF(t.stillatwayfair, 'Yes', 'No') AS `Active`,\n  CAST(t.hierarchylevel AS STRING) AS `Hierarchy Level`,\n  CAST(SAFE_CAST(t.hiredate AS DATE) AS STRING) AS `Hire Date`,\n  CAST(t.daystenured AS STRING) AS `Days Tenured`,\n\n  -- Management chain\n  CAST(t.mgremid AS STRING) AS `Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.manager, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager Name`,\n  LOWER(TRIM(COALESCE(t.mgremailaddress, ''))) AS `Manager Email`,\n  CAST(t.mgr2emid AS STRING) AS `Manager 2 ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.manager2, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Manager 2 Name`,\n  CAST(t.srmgremid AS STRING) AS `Senior Manager ID`,\n  TRIM(REGEXP_REPLACE(TRIM(COALESCE(t.srmanager, '')), r'^([^,]+),\\s*(.+)$', r'\\2 \\1')) AS `Senior Manager Name`,\n\n  -- Workgroup hierarchy\n  TRIM(COALESCE(t.team, '')) AS `Team`,\n  CAST(t.wgid AS STRING) AS `Workgroup ID`,\n  TRIM(COALESCE(t.workgroup, '')) AS `Workgroup`,\n  CAST(t.parentwgid AS STRING) AS `Parent Workgroup ID`,\n  TRIM(COALESCE(t.parentworkgroup, '')) AS `Parent Workgroup`,\n  CAST(t.grandparentwgid AS STRING) AS `Grandparent Workgroup ID`,\n  TRIM(COALESCE(t.grandparentparentworkgroup, '')) AS `Grandparent Workgroup`,\n\n  -- Site / geography\n  CAST(t.siteid AS STRING) AS `Site ID`,\n  TRIM(COALESCE(t.site, '')) AS `Site`,\n  TRIM(COALESCE(t.typeofsite, '')) AS `Site Type`,\n  CAST(t.virtualflag AS STRING) AS `Virtual Flag`,\n  TRIM(COALESCE(t.subentity, '')) AS `Subentity`,\n  CAST(t.regionid AS STRING) AS `Region ID`,\n  TRIM(COALESCE(t.region, '')) AS `Region`,\n\n  -- Skill / ranking attributes\n  CAST(t.currentskilllevel AS STRING) AS `Current Skill Level`,\n  TRIM(COALESCE(t.majorityskill, '')) AS `Majority Skill`,\n  CAST(t.skillranking AS STRING) AS `Skill Ranking`,\n  CAST(t.overallranking AS STRING) AS `Overall Ranking`,\n  CAST(t.topxpercent AS STRING) AS `Top X Percent`,\n  CAST(SAFE_CAST(t.skill_1_start_date AS DATE) AS STRING) AS `Skill 1 Start Date`,\n  CAST(SAFE_CAST(t.skill_2_start_date AS DATE) AS STRING) AS `Skill 2 Start Date`,\n  CAST(SAFE_CAST(t.skill_3_start_date AS DATE) AS STRING) AS `Skill 3 Start Date`,\n\n  -- Record metadata\n  CAST(t.styid AS STRING) AS `Style ID`,\n  CAST(t.swapid AS STRING) AS `Swap ID`,\n  CAST(SAFE_CAST(t.lastrundate AS DATE) AS STRING) AS `Last Run Date`,\n  CAST(s.snapshot_date AS STRING) AS `Snapshot Date`,\n  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP(), 'America/Phoenix') AS `Refreshed At Arizona`\nFROM `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` AS t\nCROSS JOIN latest_snapshot AS s\nWHERE t.datetype = 'Day'\n  AND t.date = s.snapshot_date\n  AND t.stillatwayfair IS TRUE\n  AND t.emid IS NOT NULL\n-- One row per employee even if the source carries multiple TimePeriod rows per day\nQUALIFY ROW_NUMBER() OVER (PARTITION BY t.emid ORDER BY t.lastrundate DESC, t.mgremid) = 1\nORDER BY `Senior Manager Name`, `Manager Name`, `Employee Name`",
+        "options": {
+          "useLegacySql": false
+        }
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [240, 448],
+      "id": "7a1c0d10-0003-4a00-8a00-000000000003",
+      "name": "BigQuery - Pull Full CS Org Roster",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleBigQueryOAuth2Api": {
+          "id": "LqbmdhbY71tJpqE8",
+          "name": "Google BigQuery account 623"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the BigQuery result into a header row + string matrix.\n// Headers are derived from the query result, so adding or removing columns in\n// the SQL requires no change here or in any downstream node.\n\nconst rows = $input.all()\n  .map((item) => item.json || {})\n  .filter((row) => Object.keys(row).length > 0);\n\nconst toText = (value) => {\n  if (value === null || value === undefined) return '';\n  if (typeof value === 'object') return JSON.stringify(value);\n  return String(value);\n};\n\nif (rows.length === 0) {\n  return [{\n    json: {\n      row_count: 0,\n      column_count: 0,\n      columns: [],\n      records: [],\n      snapshot_date: '',\n      manager_count: 0,\n    },\n  }];\n}\n\n// Union of keys across all rows, preserving BigQuery's column order.\nconst columns = [];\nfor (const row of rows) {\n  for (const key of Object.keys(row)) {\n    if (!columns.includes(key)) columns.push(key);\n  }\n}\n\nconst idColumn = columns.includes('Employee ID') ? 'Employee ID' : null;\nconst seen = new Set();\nconst records = [];\nconst managers = new Set();\n\nfor (const row of rows) {\n  const dedupeKey = idColumn ? toText(row[idColumn]) : JSON.stringify(row);\n  if (dedupeKey !== '' && seen.has(dedupeKey)) continue;\n  seen.add(dedupeKey);\n  records.push(columns.map((column) => toText(row[column])));\n  const managerId = toText(row['Manager ID']);\n  if (managerId !== '') managers.add(managerId);\n}\n\nreturn [{\n  json: {\n    row_count: records.length,\n    column_count: columns.length,\n    columns,\n    records,\n    manager_count: managers.size,\n    snapshot_date: toText(rows[0]['Snapshot Date']),\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 448],
+      "id": "7a1c0d10-0004-4a00-8a00-000000000004",
+      "name": "Code - Normalize Roster"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7a1c0d10-1001-4a00-8a00-00000000a001",
+              "leftValue": "={{ $json.row_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [720, 448],
+      "id": "7a1c0d10-0005-4a00-8a00-000000000005",
+      "name": "IF - Roster Returned Rows"
+    },
+    {
+      "parameters": {
+        "errorMessage": "BigQuery returned zero roster rows. The Google Sheet was NOT cleared, so the previous roster is preserved. Check that the source table has a daily snapshot in the last 7 days and that the BigQuery credential still has access."
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [960, 624],
+      "id": "7a1c0d10-0006-4a00-8a00-000000000006",
+      "name": "Stop and Error - Empty Result Guard"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values/Sheet1:clear",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 448],
+      "id": "7a1c0d10-0007-4a00-8a00-000000000007",
+      "name": "Sheets API - Clear Sheet1",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build one values:batchUpdate body per chunk of rows.\n// Chunking keeps each HTTP payload well inside the Google Sheets request-size\n// limit for a roster of any realistic size, while staying far below the\n// 60 write-requests-per-minute-per-user quota.\n\nconst TAB_NAME = 'Sheet1';\nconst CHUNK_ROWS = 5000;\n\nconst source = $('Code - Normalize Roster').first().json;\nconst columns = source.columns || [];\nconst records = source.records || [];\n\nconst allRows = [columns, ...records];\nconst chunks = [];\n\nfor (let offset = 0; offset < allRows.length; offset += CHUNK_ROWS) {\n  const slice = allRows.slice(offset, offset + CHUNK_ROWS);\n  const startRow = offset + 1; // A1 notation is 1-indexed\n  chunks.push({\n    json: {\n      chunk_index: chunks.length + 1,\n      chunk_rows: slice.length,\n      start_row: startRow,\n      request_body: {\n        valueInputOption: 'RAW',\n        data: [{\n          range: `${TAB_NAME}!A${startRow}`,\n          majorDimension: 'ROWS',\n          values: slice,\n        }],\n      },\n    },\n  });\n}\n\nreturn chunks.map((chunk) => ({\n  json: {\n    ...chunk.json,\n    chunk_total: chunks.length,\n  },\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 448],
+      "id": "7a1c0d10-0008-4a00-8a00-000000000008",
+      "name": "Code - Build Sheets Write Chunks"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.request_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 448],
+      "id": "7a1c0d10-0009-4a00-8a00-000000000009",
+      "name": "Sheets API - Write Roster Chunk",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PcfcRoJYVJF77r1J",
+          "name": "Google Sheets account 792"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $('Code - Normalize Roster').first().json;\nconst chunks = $('Code - Build Sheets Write Chunks').all();\n\nreturn [{\n  json: {\n    status: 'SUCCESS',\n    spreadsheet_id: '1w-PBwKVwLoqQ7tF22baZFKAvb-Gn6f29Brwv1OdIPf4',\n    spreadsheet_name: 'Org Broswer N8N Refresh Mondays',\n    tab_name: 'Sheet1',\n    employee_row_count: source.row_count,\n    distinct_manager_count: source.manager_count,\n    column_count: source.column_count,\n    columns_written: source.columns,\n    snapshot_date: source.snapshot_date,\n    sheets_write_requests_used: chunks.length + 1,\n    schedule: 'Mondays 04:00 America/Phoenix (Arizona, no DST) = 11:00 UTC',\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 448],
+      "id": "7a1c0d10-0010-4a00-8a00-000000000010",
+      "name": "Code - Refresh Complete",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## Org Browser Full Roster - Weekly Monday 4AM Arizona\n\nStandalone. Does not touch the TM PDP/ROD/PIP workflow. No documents generated, no emails sent.\n\n### What it writes\nEvery ACTIVE Customer Service employee (agents) as one row, with the full management chain (Manager / Manager 2 / Senior Manager), workgroup hierarchy, site, region, and skill attributes. The previous version of this workflow used SELECT DISTINCT on manager fields only, which collapsed agents out of the result.\n\nSource: `wf-gcp-us-ae-cs-prod.cs_reporting.tbl_customer_service_employee_performance_manager` (employee/day level, so no join needed).\n\n### Schedule\nWorkflow timezone is set to `America/Phoenix`, cron `0 4 * * 1`. Arizona does not observe DST, so this is 11:00 UTC year-round. CONFIRM the timezone in Workflow Settings after import - if the instance default overrides it, the run will drift.\n\n### Safety\nIf BigQuery returns zero rows the sheet is NOT cleared and the run fails loudly, so a bad query can never blank the directory.\n\nThe query takes the most recent daily snapshot in the last 7 days rather than hard-coding yesterday, so a missing Sunday snapshot does not produce an empty Monday run.\n\n### To change the destination\nSpreadsheet ID and tab name appear in 4 places: the two HTTP Request node URLs, `TAB_NAME` in Code - Build Sheets Write Chunks, and the summary in Code - Refresh Complete.\n\n### After import\nSelect your BigQuery and Google Sheets OAuth credentials on the three credentialed nodes, run manually once, then activate.",
+        "height": 640,
+        "width": 740,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-780, 140],
+      "id": "7a1c0d10-0011-4a00-8a00-000000000011",
+      "name": "README"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run Refresh Manually": {
+      "main": [[{ "node": "BigQuery - Pull Full CS Org Roster", "type": "main", "index": 0 }]]
+    },
+    "Weekly - Mondays 4:00 AM Arizona": {
+      "main": [[{ "node": "BigQuery - Pull Full CS Org Roster", "type": "main", "index": 0 }]]
+    },
+    "BigQuery - Pull Full CS Org Roster": {
+      "main": [[{ "node": "Code - Normalize Roster", "type": "main", "index": 0 }]]
+    },
+    "Code - Normalize Roster": {
+      "main": [[{ "node": "IF - Roster Returned Rows", "type": "main", "index": 0 }]]
+    },
+    "IF - Roster Returned Rows": {
+      "main": [
+        [{ "node": "Sheets API - Clear Sheet1", "type": "main", "index": 0 }],
+        [{ "node": "Stop and Error - Empty Result Guard", "type": "main", "index": 0 }]
+      ]
+    },
+    "Sheets API - Clear Sheet1": {
+      "main": [[{ "node": "Code - Build Sheets Write Chunks", "type": "main", "index": 0 }]]
+    },
+    "Code - Build Sheets Write Chunks": {
+      "main": [[{ "node": "Sheets API - Write Roster Chunk", "type": "main", "index": 0 }]]
+    },
+    "Sheets API - Write Roster Chunk": {
+      "main": [[{ "node": "Code - Refresh Complete", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timezone": "America/Phoenix",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "versionId": "8f2b41d6-0c7a-4e55-9b31-5a7c2e9d4b10",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "03eaefce1798e2883471ae7d5d2dfbc186343411ac19c565c97d8bae537d45f1"
+  },
+  "nodeGroups": [],
+  "id": "OrgBrowserRosterWk1",
+  "tags": []
+}
